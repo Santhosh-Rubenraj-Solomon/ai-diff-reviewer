@@ -1,0 +1,37 @@
+{
+  "name": "ai-diff-reviewer",
+  "version": "0.1.0",
+  "description": "Reviews your local git diff with Gemini. Uses git history as context and adversarial verification to cut false positives. Zero infrastructure.",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "aidr": "./src/cli.ts"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "code-review",
+    "ai",
+    "gemini",
+    "git",
+    "diff",
+    "cli",
+    "bun"
+  ],
+  "scripts": {
+    "start": "bun run src/cli.ts",
+    "typecheck": "bunx tsc --noEmit",
+    "test": "bun test",
+    "build": "bun build --compile --minify --outfile dist/aidr src/cli.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.6.0"
+  },
+  "engines": {
+    "bun": ">=1.1.0"
+  }
+}
