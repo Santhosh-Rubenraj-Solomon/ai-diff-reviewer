@@ -1,0 +1,27 @@
+{
+  "id": "docs-only-readme",
+  "split": "holdout",
+  "source": "seed case — a change that should produce nothing",
+  "title": "Document the deploy step",
+  "description": "No code change. Adds the missing deploy instruction to the README.",
+  "files": [
+    {
+      "path": "README.md",
+      "status": "modified",
+      "diff": "@@ -8,2 +8,4 @@\n ## Deploying\n \n+Run `make deploy` from the release branch. The pipeline publishes the image\n+and then rolls the deployment one pod at a time.",
+      "headContent": "# Service\n\nA small service.\n\n## Running\n\n`make run`\n\n## Deploying\n\nRun `make deploy` from the release branch. The pipeline publishes the image\nand then rolls the deployment one pod at a time.\n"
+    }
+  ],
+  "expected": [],
+  "forbidden": [
+    {
+      "match": "test",
+      "why": "a documentation-only change does not need tests"
+    },
+    {
+      "match": "error handling",
+      "why": "there is no code in this change to handle errors in"
+    }
+  ],
+  "stubFindings": []
+}

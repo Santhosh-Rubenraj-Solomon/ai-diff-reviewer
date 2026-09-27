@@ -1,34 +1,53 @@
 {
   "name": "ai-diff-reviewer",
-  "version": "0.1.0",
-  "description": "Reviews your local git diff with Gemini. Uses git history as context and adversarial verification to cut false positives. Zero infrastructure.",
+  "version": "1.0.0",
+  "description": "An LLM code reviewer for GitLab and GitHub. Deterministic code decides what the model sees; every published finding quotes code that exists at a line that changed.",
   "type": "module",
   "license": "MIT",
+  "author": "Santhosh Rubenraj Solomon",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Santhosh-Rubenraj-Solomon/ai-diff-reviewer.git"
+  },
   "bin": {
     "aidr": "./src/cli.ts"
   },
   "files": [
     "src",
+    ".review",
     "README.md",
     "LICENSE"
   ],
   "keywords": [
     "code-review",
     "ai",
-    "gemini",
-    "git",
-    "diff",
-    "cli",
+    "claude",
+    "anthropic",
+    "gitlab",
+    "github",
+    "merge-request",
+    "pull-request",
+    "static-analysis",
     "bun"
   ],
   "scripts": {
-    "start": "bun run src/cli.ts",
+    "review": "bun run src/cli.ts review",
+    "rules:check": "bun run src/cli.ts rules check",
+    "evals": "bun run evals/run.ts",
+    "evals:report": "bun run evals/report.ts",
     "typecheck": "bunx tsc --noEmit",
     "test": "bun test",
     "build": "bun build --compile --minify --outfile dist/aidr src/cli.ts"
   },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.128.0",
+    "picomatch": "^4.0.7",
+    "yaml": "^2.9.1",
+    "zod": "^4.6.5"
+  },
   "devDependencies": {
     "@types/bun": "latest",
+    "@types/picomatch": "^4.0.2",
     "typescript": "^5.6.0"
   },
   "engines": {

@@ -1,0 +1,41 @@
+import { sessions } from '../infra/sessions';
+import { users } from '../infra/users';
+import { assertAuthorized } from './policy';
+
+export interface Session {
+  id: string;
+  userId: string;
+  role: string;
+  expiresAt: number;
+  revoked: boolean;
+}
+
+export async function loadSession(token: string): Promise<Session | null> {
+  const session = await sessions.findByToken(token);
+  if (session === null) {
+    return null;
+  }
+  if (session.revoked === true) {
+    return null;
+  }
+  const isExpired = session.expiresAt <= Date.now();
+  if (isExpired) {
+    return null;
+  }
+  return session;
+}
+
+export async function deleteAccount(token: string, targetUserId: string): Promise<void> {
+  const session = await loadSession(token);
+  if (session === null) {
+    throw new Error('not authenticated');
+  }
+  assertAuthorized(session.role, 'account:delete');
+  await users.remove(targetUserId);
+  await sessions.revokeAllForUser(targetUserId);
+}
+
+export function remainingSeconds(session: Session, now: number): number {
+  const remaining = Math.floor((session.expiresAt - now) / 1000);
+  return remaining >= 0 ? remaining : 0;
+}

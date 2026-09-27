@@ -1,178 +1,266 @@
-# aidr — AI diff reviewer
+# aidr — an LLM code reviewer for GitLab and GitHub
 
-Reviews your local git diff with Gemini, from the terminal. Two things make it
-different from the rest of the category:
+Reviews a merge request or pull request with Claude and posts inline comments.
+Deterministic code decides what the model sees; the model only judges. Every
+finding that gets posted quotes code that exists, at a line that changed.
 
-**It reads the repository's memory, not just the diff.** Every AI reviewer feeds
-the model the changed lines. The expensive ones also feed repo-wide semantic
-context. None of them feed the history of *the exact lines you touched*. `git log`
-and `git blame -L` on those line ranges give churn, prior fixes, and reverts —
-signal that is local, free, instant, and sitting unused in every repository.
+Built by **Santhosh Rubenraj Solomon**. TypeScript on Bun. MIT.
 
-**Every comment has to survive an argument against itself.** Published benchmarks
-put the leading tools at roughly half precision: about one comment in two is
-wrong. Self-reported confidence scores don't fix that — they cluster tightly and
-barely discriminate. So each candidate finding is sent back to the model with
-instructions to refute it. What can't defend itself never reaches you. There is
-no comment cap; the count varies with the diff, and **zero findings is a valid
-and meaningful result.**
+---
 
-And it has **no infrastructure**. No Docker, no database, no webhook server, no
-hosted account, no GitHub API, no OAuth. It reads local git and calls one HTTP
-endpoint.
+## Why this one
 
-Because it reads git rather than a pull-request API, it isn't tied to pull
-requests at all. A PR diff is just one of four sources — and the useful ones are
-the two you can run *before* you push.
+Most LLM reviewers make their guarantees in prose — "evidence must be
+verbatim", "we filter low-confidence findings", "every file is reviewed" — and
+enforce none of them. The failure is always the same shape: the prose says one
+thing, the code does another, and nobody can tell because the tool reports
+success either way.
 
-## Install
+The five rules this codebase is organised around:
 
-Requires [Bun](https://bun.sh) and a [Gemini API key](https://aistudio.google.com/apikey).
+1. **Deterministic code decides what the model sees; the model only judges.**
+   Diff parsing, file selection, graph walks and budgets are all in code. No
+   model picks which files get reviewed or how they are batched.
+2. **Every published finding quotes code that exists, at a line that changed.**
+   Checked in [`src/review/verify.ts`](src/review/verify.ts) against the file
+   at head — in code, before posting. Not with a prompt.
+3. **Silence is a bug.** A skipped file, a dropped rule, a failed batch, a
+   substituted model — each appears in the run status, the summary comment and
+   the exit code.
+4. **Re-running converges, not accumulates.** A second run on the same commit
+   posts nothing. A run after a push posts what is new and resolves what was
+   fixed.
+5. **Anything measured improves.** The eval harness shipped before the context
+   engine, and the context engine has to beat the baseline to stay.
+
+---
+
+## Quick start
 
 ```bash
-git clone https://github.com/Santhosh-Rubenraj-Solomon/ai-diff-reviewer.git
-cd ai-diff-reviewer
 bun install
-export GEMINI_API_KEY=...
+
+# Review your working tree against the merge base, post nothing:
+ANTHROPIC_API_KEY=… bun run src/cli.ts review --platform=local --dry-run
+
+# Validate your rules (exits non-zero on error — safe to gate CI on):
+bun run src/cli.ts rules check
+
+# Run the eval harness offline, with no API key at all:
+bun run evals
 ```
 
-Run it from inside any git repository:
-
-```bash
-bun run /path/to/ai-diff-reviewer/src/cli.ts
-```
-
-Or compile a standalone binary and drop it on your `PATH`:
+A single-binary build for CI runners:
 
 ```bash
 bun run build     # -> dist/aidr
 ```
 
-## Use
+---
 
-```bash
-aidr                    # infers what you meant from git state
-aidr --staged           # git diff --cached
-aidr --working          # git diff
-aidr --branch main      # git diff main...HEAD
-aidr --commit HEAD~1    # git show HEAD~1
-aidr --verbose          # also show what verification threw out, and why
-```
-
-With no target, it infers one — staged changes, else a dirty working tree, else
-this branch against its base — presents it pre-selected, and accepts on Enter.
-`--yes` skips the prompt, and so does any non-TTY context, so it drops into
-hooks and CI unchanged.
+## How a run works
 
 ```
-$ aidr --working --yes
-Reviewing working tree — 1 file
-
-src/paging.ts
-  bug  :8  totalPages returns Infinity or NaN for invalid `size`.
-       The removal of the `if (size <= 0) return 0;` check reintroduces a
-       divide-by-zero error. If `size` is 0 or negative, `count / size` will
-       result in `Infinity` or `NaN`, which `Math.ceil` will propagate.
-       │ -  if (size <= 0) return 0;
-       history: fix: off-by-one in pageSlice offset and divide-by-zero in totalPages
-
-────────────────────────────────────────────────────────────
-1 bug · 1 chunk(s) reviewed · 1 discarded by verification · 3 verification call(s)
+intake ──► rules ──► context ──► cache ──► review ──► verify ──► judge ──► publish
+   │          │         │          │          │          │         │          │
+  SHA-      target    repo at    content-   batched    code-     model     inline +
+ pinned     branch    head SHA   addressed  by real    only      with      one edited
+ ChangeSet  only      + graph    per file   tokens     gate      the code  summary
 ```
 
-That `history:` line is the differentiator doing its job: blame on the deleted
-line pointed at the commit that added the guard, so the model could say this
-change re-opens a bug someone already closed. The `1 discarded` is the precision
-mechanism doing its job — a third finding was raised, argued against, and lost.
+| Stage | File | What it guarantees |
+|---|---|---|
+| intake | [`src/platform/`](src/platform/) | Everything pinned to `base`/`start`/`head` SHAs; forks read from the source project; pagination followed |
+| rules | [`src/rules/load.ts`](src/rules/load.ts) | Read from the **target** branch, so an MR cannot rewrite the rules that judge it |
+| context | [`src/context/`](src/context/) | Repo cached by SHA; ripple context only for symbols the diff touched |
+| cache | [`src/store/db.ts`](src/store/db.ts) | Keyed on content hash + rules hash + prompt version + model — never on path |
+| review | [`src/review/run.ts`](src/review/run.ts) | Structured outputs; a schema miss is a failed call, never "zero findings" |
+| verify | [`src/review/verify.ts`](src/review/verify.ts) | Path, line-in-hunk, verbatim evidence, praise, confidence, duplicates |
+| judge | [`src/review/judge.ts`](src/review/judge.ts) | One finding per call, **with the surrounding code** and any cited rule |
+| publish | [`src/publish/comments.ts`](src/publish/comments.ts) | Fingerprinted identity, idempotent posting, one summary edited in place |
 
 ### Exit codes
 
-| Code | Meaning |
-|---|---|
-| `0` | No surviving bug-severity findings |
-| `1` | At least one surviving bug-severity finding |
-| `2` | The tool could not run |
+| Status | Exit | Meaning |
+|---|---|---|
+| `completed` | 0 | Every changed file reviewed, comments posted |
+| `partial` | 0, or 1 with `--strict` | Something degraded; what survived was posted |
+| `interrupted` | 1 | Model or API failure; results incomplete |
+| `failed` | 1 | Precondition or unrecoverable error |
 
-Which makes it a pre-commit hook in one line:
+`--fail-on=high` additionally exits 1 when a finding at or above that severity
+was posted. Start advisory; turn this on once you have measured precision.
 
-```bash
-# .git/hooks/pre-commit
-aidr --staged --yes || exit 1
-```
-
-## How it works
-
-```
-target ─→ diff ─→ filter ─→ chunk ─→ history ─→ review ─→ verify ─→ render
-```
-
-1. **Target** — infer from git state (staged › working tree › branch vs base), confirm, or take an explicit flag.
-2. **Diff** — one git command per target. That's the only difference between them.
-3. **Filter** — drop binary files, lockfiles, vendored and generated paths, and any single file over the size ceiling. Excluded paths are *reported*, never silently dropped.
-4. **Chunk** — one file per chunk; a large file is split along hunk boundaries so each chunk is still a valid standalone diff.
-5. **History** — `git log` on the file, `git blame -L` on the touched line ranges. New files degrade to an explicit "no history available" marker that the prompt states plainly, rather than an empty section the model would fill with guesses.
-6. **Review** — one Gemini call per chunk, bounded concurrency, structured JSON out. Unparseable output is retried once, then that chunk is skipped with a recorded warning.
-7. **Verify** — one call per finding, instructed to argue the finding is wrong. Survivors are kept; the rest are discarded with a reason (`--verbose` shows them).
-8. **Render** — grouped by file, ordered by severity, with the history basis shown where one exists.
-
-### Design notes
-
-**A threshold, not a cap.** An earlier design capped output at five comments. A
-diff with twelve real bugs would have seven silently dropped — the same failure
-mode as a reviewer who stops reading. Filtering on *survival* produces a count
-that scales with the diff.
-
-**The verification ceiling doesn't drop findings.** There is a ceiling on total
-verification calls, purely so a pathological diff can't spend unbounded API
-calls. Findings past it are shown flagged `[unverified]`, never hidden — and the
-ceiling is spent highest-severity-first so it never runs out on nits.
-
-**Two model settings that default to the same model.** The two-tier idea (cheap
-model reads, strong model judges) is economically right, but the recall ceiling
-is set entirely by the reading pass, since verification can only remove. Picking
-tiers without real output to judge would be guesswork, so `--model` and
-`--verify-model` are separate values that default to the same string. The option
-costs nothing until there's evidence to spend it on.
-
-**Local git over the GitHub API.** Dropping the GitHub integration removed
-OAuth, token scopes, rate limits and the comment-posting path — the largest
-block of work in the original concept — while making the history differentiator
-*stronger*, not weaker. The reviewer/renderer seam is where a GitHub renderer
-would attach later, without touching anything upstream of it.
+---
 
 ## Configuration
 
-Every flag has an environment variable. See [`src/config.ts`](src/config.ts).
+Environment only — there is no config file in `$HOME`, so CI and local behave
+identically. CLI flags override the environment.
 
-| Variable | Default | Purpose |
+| Variable | Default | Notes |
 |---|---|---|
-| `GEMINI_API_KEY` | — | Required |
-| `AIDR_REVIEW_MODEL` | `gemini-2.5-flash` | Model for the review pass |
-| `AIDR_VERIFY_MODEL` | `gemini-2.5-flash` | Model for the verify pass |
-| `AIDR_CONCURRENCY` | `4` | Parallel model calls |
-| `AIDR_MAX_VERIFY_CALLS` | `40` | Verification call ceiling |
-| `AIDR_MAX_FILE_DIFF_BYTES` | `60000` | Above this, a file is excluded |
-| `AIDR_MAX_CHUNK_BYTES` | `20000` | Above this, a file is split by hunk |
-| `AIDR_LOG_DEPTH` | `20` | Commits of file history to read |
-| `AIDR_CHURN_WINDOW_DAYS` | `90` | Window for the recent-churn signal |
+| `ANTHROPIC_API_KEY` | — | Required for a real review |
+| `REVIEWER_PLATFORM` | inferred from CI | `gitlab` \| `github` \| `local` |
+| `REVIEWER_TOKEN` | `GITHUB_TOKEN` | Bot token; comment scope only |
+| `REVIEWER_PROJECT_ID` | CI variable | Project id, or `owner/repo` |
+| `REVIEWER_MR_IID` | CI variable | MR iid / PR number |
+| `REVIEWER_REVIEW_MODEL` | `claude-opus-5` | Review pass |
+| `REVIEWER_JUDGE_MODEL` | `claude-sonnet-5` | Gate two |
+| `REVIEWER_FALLBACK_MODEL` | `claude-opus-4-8` | Used only on a refusal; `none` to disable |
+| `REVIEWER_REVIEW_EFFORT` | `xhigh` | `low`…`max` |
+| `REVIEWER_BUDGET_USD` | `2` | Hard per-run ceiling; posts what it has and marks the run partial |
+| `REVIEWER_CONFIDENCE` | `0.6` | Verification threshold; tune on the golden set |
+| `REVIEWER_DEADLINE_MS` | `900000` | Whole-run deadline |
+| `REVIEWER_CONTEXT` | `full` | `full` \| `diff` \| `off` |
+| `REVIEWER_JUDGE` | `on` | `on` \| `off` |
+
+There are deliberately **no `--no-x` flags**. Use `--context=off`, not
+`--no-context`: a negation flag that silently becomes a no-op is worse than no
+flag at all.
+
+---
+
+## Rules
+
+One markdown file per rule area in `.review/`, read from the target branch:
+
+```markdown
+---
+id: payments-money-types          # stable; findings cite it
+globs: ["src/payments/**/*.ts"]   # omit entirely for a global rule
+severity: high
+priority: 10                      # decides who survives the byte budget
+---
+Money is always integer minor units (`amountMinor`).
+
+Flag: floats for money, `parseFloat` on amounts, implicit currency.
+Do not flag: `amountMinor` arithmetic without a currency check inside a
+single-currency module.
+```
+
+- `globs` **omitted** means global. `globs` present but empty or malformed is
+  an **error**, not a promotion to global.
+- Findings cite `ruleIds`, so you can measure which rules earn their tokens.
+- The judge is shown the text of any rule a finding cites, so a rule-backed
+  finding cannot be rejected as "generic advice".
+- `aidr rules check` exits non-zero on a bad rule, an oversized rule, or a
+  scoped rule that matches nothing.
+
+This repository dogfoods its own rules in [`.review/`](.review/).
+
+---
+
+## Evals
+
+The harness ships before the features it measures, and runs entirely on frozen
+fixtures — no platform API, nothing posted.
+
+```bash
+bun run evals                       # stub reviewer, offline, no API key
+bun run evals --reviewer=model      # real review pass
+bun run evals --reviewer=model --mode=batch   # Batch API, ~50% cheaper
+bun run evals --split=holdout       # report on the held-out half only
+```
+
+The set has two halves:
+
+- **Curated cases** in [`evals/cases/`](evals/cases/) — each labelled with
+  `expected` (findings a human made or would have made) and `forbidden` (noise
+  you never want again).
+- **Injected bugs** — 20 single-line mutations generated from clean fixtures by
+  [`evals/mutate.ts`](evals/mutate.ts): off-by-one, dropped `await`, swapped
+  arguments, inverted guard, wrong unit, removed authorisation, SQL built by
+  concatenation, lost update. Recall on these is a number you control.
+
+Reported per variant, split train/holdout:
+
+| Metric | Starting target |
+|---|---|
+| Recall on injected bugs | ≥ 0.6 |
+| Precision (lower bound) | ≥ 0.7 |
+| Noise per case | ≤ 1 |
+| Cost per case p50/p90 | ≤ $0.50 |
+| Latency p90 | ≤ 4 min |
+
+> **The six curated cases are seeds, not a golden set.** They are hand-written
+> illustrations. A set that means something is built from your own merge
+> requests. `bun run evals/import.ts --platform=github --project=owner/repo
+> --pr=412 --split=train` freezes a real MR into a fixture; you then fill in
+> `expected` and `forbidden` by hand. Get to 15–20 real cases before trusting a
+> precision number, and tune on `train` while reporting on `holdout`.
+
+---
+
+## CI
+
+### GitLab
+
+```yaml
+llm-review:
+  stage: review
+  image: oven/bun:1
+  rules:
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+  interruptible: true
+  allow_failure: true          # advisory until you have measured precision
+  script:
+    - bunx @santhosh/ai-diff-reviewer review
+```
+
+`ANTHROPIC_API_KEY` and `REVIEWER_TOKEN` are masked CI variables; everything
+else is read from the standard `CI_*` variables.
+
+### GitHub
+
+See [`.github/workflows/review.yml`](.github/workflows/review.yml).
+
+Roll out in stages: `--dry-run` for a week (findings in the job log only), then
+your own MRs, then opt-in repositories, then default on — still advisory.
+
+---
+
+## Security
+
+- Secrets are redacted from diffs and file bodies **before** any model call,
+  and the count of redactions is recorded.
+- All merge-request content is wrapped in `<untrusted_input>` tags, and the
+  system prompt states that nothing inside them is an instruction.
+- Rules come from the protected target branch, so the author of a change
+  cannot supply the rules that judge it.
+- Comment bodies are neutralised: GitLab quick actions at the start of a line
+  are escaped and `@mentions` are broken, outside fenced code.
+- Raw model output is written to disk only behind `--debug-dir`.
+- Run state lives in a project-local SQLite file, not in `os.tmpdir()` keyed by
+  MR number where two projects collide.
+
+Use a bot account whose token can comment but cannot approve or merge.
+
+---
+
+## Known limits
+
+- **The context engine is lexical, not a full parse.** `src/context/parse.ts`
+  extracts imports, exports and symbol ranges with regexes and brace balancing
+  for TypeScript/JavaScript and Python. It is an approximation, it is named in
+  every run's degradations (`context-analyzer:lexical-js`), and `Analyzer` is
+  an interface so tree-sitter can replace it without touching the pipeline. It
+  is deliberately not a native dependency that returns nothing when a grammar
+  fails to load.
+- **Six curated eval cases, not fifteen.** See the note above.
+- **GitHub thread resolution needs GraphQL**, which this uses; a thread whose
+  id cannot be resolved gets a reply saying it was fixed and a recorded warning.
+- **Model-requested file reads are not implemented.** The path allow-list, the
+  deny-list and the repo confinement are in `src/review/secrets.ts` ready for
+  it, but the tool feature itself is not wired up.
+
+---
 
 ## Development
 
 ```bash
-bun test          # 38 tests over diff parsing, history parsing, ceilings, rendering
-bun run typecheck # tsc --noEmit, strict
+bun test              # 79 tests
+bunx tsc --noEmit     # strict, no implicit any, no unchecked index access
+bun run evals         # offline
+bun run src/cli.ts rules check
 ```
-
-The model-calling paths are deliberately not mocked into the test suite; the
-pure logic around them — diff parsing, chunk splitting, blame parsing, the
-verification ceiling, render ordering — is covered directly.
-
-## Not in v1
-
-GitHub API integration, posting comments to pull requests, review caching,
-incremental review from the last-reviewed commit, npm publishing, config files,
-providers other than Gemini, inline line-anchored comments.
-
-## License
-
-MIT

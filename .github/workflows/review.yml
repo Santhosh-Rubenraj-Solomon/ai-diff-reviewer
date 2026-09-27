@@ -1,0 +1,38 @@
+name: aidr review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+# Least privilege: comment on pull requests, read the code, nothing else.
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  # A new push cancels the review of the commit it replaced.
+  group: aidr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    # Advisory until precision has been measured on your own golden set.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - run: bun install --frozen-lockfile
+
+      - name: Review
+        run: bun run src/cli.ts review
+        env:
+          REVIEWER_PLATFORM: github
+          REVIEWER_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          REVIEWER_PROJECT_ID: ${{ github.repository }}
+          REVIEWER_MR_IID: ${{ github.event.pull_request.number }}
+          REVIEWER_LOG_FORMAT: json

@@ -1,0 +1,53 @@
+{
+  "id": "cache-key-on-path",
+  "split": "train",
+  "source": "seed case — replace with a real MR from your own history",
+  "title": "Cache computed results",
+  "description": "Adds a small in-process cache so repeated lookups are cheap.",
+  "files": [
+    {
+      "path": "src/cache/results.ts",
+      "status": "modified",
+      "diff": "@@ -2,1 +2,8 @@\n \n+export function cacheKey(path: string): string {\n+  return path;\n+}\n+\n+export function remember(path: string, value: string): void {\n+  store.set(cacheKey(path), value);\n+}",
+      "headContent": "const store = new Map<string, string>();\n\nexport function cacheKey(path: string): string {\n  return path;\n}\n\nexport function remember(path: string, value: string): void {\n  store.set(cacheKey(path), value);\n}\n"
+    }
+  ],
+  "expected": [
+    {
+      "path": "src/cache/results.ts",
+      "line": 3,
+      "description": "the cache key is the path alone, so a stale result is returned after the file content changes",
+      "severity": "high"
+    }
+  ],
+  "forbidden": [
+    {
+      "match": "consider extracting",
+      "why": "structural preference with no defect behind it"
+    }
+  ],
+  "stubFindings": [
+    {
+      "path": "src/cache/results.ts",
+      "line": 3,
+      "severity": "high",
+      "category": "bug",
+      "title": "Key the cache on content, not on path",
+      "body": "cacheKey uses only the path, so a changed file returns the previous cached result until the process restarts.",
+      "evidence": "export function cacheKey(path: string): string {",
+      "ruleIds": [],
+      "confidence": 0.86
+    },
+    {
+      "path": "src/cache/results.ts",
+      "line": 7,
+      "severity": "low",
+      "category": "style",
+      "title": "Consider extracting a Cache class",
+      "body": "You could consider extracting these two functions into a Cache class for readability.",
+      "evidence": "export function remember(path: string, value: string): void {",
+      "ruleIds": [],
+      "confidence": 0.72
+    }
+  ]
+}

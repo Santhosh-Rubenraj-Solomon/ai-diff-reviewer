@@ -1,0 +1,27 @@
+{
+  "id": "tests-only-change",
+  "split": "holdout",
+  "source": "seed case — a change that should produce nothing",
+  "title": "Add a regression test for the refund guard",
+  "description": "Test-only change. No production code touched.",
+  "files": [
+    {
+      "path": "test/refund.test.ts",
+      "status": "modified",
+      "diff": "@@ -4,1 +4,7 @@\n \n+test('rejects a refund larger than the remaining amount', () => {\n+  expect(() => guard({ amountMinor: 5000, remainingMinor: 4000 })).toThrow(\n+    'refund exceeds the remaining refundable amount',\n+  );\n+});",
+      "headContent": "import { expect, test } from 'bun:test';\n\nimport { guard } from '../src/payments/guard';\n\ntest('rejects a refund larger than the remaining amount', () => {\n  expect(() => guard({ amountMinor: 5000, remainingMinor: 4000 })).toThrow(\n    'refund exceeds the remaining refundable amount',\n  );\n});\n"
+    }
+  ],
+  "expected": [],
+  "forbidden": [
+    {
+      "match": "missing test",
+      "why": "this change is the test; asking for tests on a test file is noise"
+    },
+    {
+      "match": "add test coverage",
+      "why": "this change is the test"
+    }
+  ],
+  "stubFindings": []
+}

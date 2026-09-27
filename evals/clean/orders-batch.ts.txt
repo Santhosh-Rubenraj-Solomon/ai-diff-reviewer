@@ -1,0 +1,48 @@
+import { db } from '../infra/db';
+
+export interface OrderLine {
+  sku: string;
+  quantity: number;
+  unitPriceMinor: number;
+}
+
+export async function loadLines(orderIds: string[]): Promise<Map<string, OrderLine[]>> {
+  const rows = await db.query(
+    'SELECT order_id, sku, quantity, unit_price_minor FROM order_lines WHERE order_id = ANY($1)',
+    [orderIds],
+  );
+
+  const byOrder = new Map<string, OrderLine[]>();
+  for (const row of rows) {
+    const existing = byOrder.get(row.order_id);
+    if (existing === undefined) {
+      byOrder.set(row.order_id, [row]);
+    } else {
+      existing.push(row);
+    }
+  }
+  return byOrder;
+}
+
+export function totalMinor(lines: OrderLine[]): number {
+  let total = 0;
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    total += line.quantity * line.unitPriceMinor;
+  }
+  return total;
+}
+
+export async function archiveCompleted(orderIds: string[]): Promise<number> {
+  let archived = 0;
+  await db.transaction(async (tx) => {
+    for (const orderId of orderIds) {
+      const order = await tx.findOrder(orderId);
+      if (order.status === 'completed') {
+        await tx.archive(orderId);
+        archived += 1;
+      }
+    }
+  });
+  return archived;
+}

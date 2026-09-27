@@ -1,0 +1,42 @@
+{
+  "id": "orders-n-plus-one",
+  "split": "train",
+  "source": "seed case — replace with a real MR from your own history",
+  "title": "List orders with their customers",
+  "description": "New endpoint helper for the orders table in the admin UI.",
+  "files": [
+    {
+      "path": "src/orders/list.ts",
+      "status": "modified",
+      "diff": "@@ -2,1 +2,10 @@\n \n+export async function listWithCustomers(orderIds: string[]) {\n+  const out = [];\n+  for (const id of orderIds) {\n+    const order = await db.findOrder(id);\n+    const customer = await db.findCustomer(order.customerId);\n+    out.push({ order, customer });\n+  }\n+  return out;\n+}",
+      "headContent": "import { db } from '../infra/db';\n\nexport async function listWithCustomers(orderIds: string[]) {\n  const out = [];\n  for (const id of orderIds) {\n    const order = await db.findOrder(id);\n    const customer = await db.findCustomer(order.customerId);\n    out.push({ order, customer });\n  }\n  return out;\n}\n"
+    }
+  ],
+  "expected": [
+    {
+      "path": "src/orders/list.ts",
+      "line": 6,
+      "description": "two queries per order inside the loop, an N+1 that scales with the length of the input array",
+      "severity": "high"
+    }
+  ],
+  "forbidden": [
+    {
+      "match": "add a type annotation",
+      "why": "a missing return type on an internal helper is not worth a review comment here"
+    }
+  ],
+  "stubFindings": [
+    {
+      "path": "src/orders/list.ts",
+      "line": 6,
+      "severity": "high",
+      "category": "performance",
+      "title": "Load orders and customers in two queries, not two per order",
+      "body": "The loop issues two database round trips per order id, so a request with 500 ids performs 1000 queries. Fetch both sets in bulk before the loop.",
+      "evidence": "    const order = await db.findOrder(id);",
+      "ruleIds": [],
+      "confidence": 0.84
+    }
+  ]
+}

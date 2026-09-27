@@ -1,0 +1,46 @@
+import { gateway } from '../infra/gateway';
+import { orders } from '../infra/orders';
+import { ledger } from '../infra/ledger';
+
+export interface RefundRequest {
+  orderId: string;
+  amountMinor: number;
+  currency: string;
+  idempotencyKey: string;
+}
+
+export async function refund(request: RefundRequest): Promise<string> {
+  const order = await orders.find(request.orderId);
+  if (!order) {
+    throw new Error(`unknown order ${request.orderId}`);
+  }
+  if (order.currency !== request.currency) {
+    throw new Error('currency mismatch');
+  }
+
+  const alreadyRefundedMinor = await ledger.refundedTotalMinor(request.orderId);
+  const remainingMinor = order.totalMinor - alreadyRefundedMinor;
+  if (request.amountMinor > remainingMinor) {
+    throw new Error('refund exceeds the remaining refundable amount');
+  }
+
+  const existing = await ledger.findByIdempotencyKey(request.idempotencyKey);
+  if (existing) {
+    return existing.refundId;
+  }
+
+  const refundId = await gateway.refund(order.transactionId, request.amountMinor);
+  await ledger.record({
+    orderId: request.orderId,
+    refundId,
+    amountMinor: request.amountMinor,
+    idempotencyKey: request.idempotencyKey,
+  });
+
+  return refundId;
+}
+
+export function refundableMinor(totalMinor: number, refundedMinor: number): number {
+  const remaining = totalMinor - refundedMinor;
+  return remaining > 0 ? remaining : 0;
+}

@@ -1,0 +1,19 @@
+# Drop this into a project, set ANTHROPIC_API_KEY and REVIEWER_TOKEN as masked
+# CI variables, and the job is one line. Everything else comes from the
+# standard CI_* variables.
+
+llm-review:
+  stage: test
+  image: oven/bun:1
+  rules:
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+  # A new push cancels the review of the commit it replaced.
+  interruptible: true
+  # Advisory until precision has been measured on your own golden set.
+  allow_failure: true
+  variables:
+    REVIEWER_PLATFORM: gitlab
+    REVIEWER_LOG_FORMAT: json
+  script:
+    - bun install --frozen-lockfile
+    - bun run src/cli.ts review

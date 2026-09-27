@@ -1,0 +1,46 @@
+{
+  "id": "payments-minor-unit-guard",
+  "split": "train",
+  "source": "seed case — replace with a real MR from your own history",
+  "title": "Add partial refunds",
+  "description": "Adds a partialRefund helper so support can refund part of an order.",
+  "files": [
+    {
+      "path": "src/payments/partial.ts",
+      "status": "modified",
+      "diff": "@@ -3,1 +3,8 @@\n \n+export async function partialRefund(orderId: string, amountMinor: number): Promise<string> {\n+  const order = await orders.find(orderId);\n+  if (amountMinor > order.total) {\n+    throw new Error('refund exceeds order total');\n+  }\n+  return gateway.refund(order.transactionId, amountMinor);\n+}",
+      "headContent": "import { gateway } from '../infra/gateway';\nimport { orders } from '../infra/orders';\n\nexport async function partialRefund(orderId: string, amountMinor: number): Promise<string> {\n  const order = await orders.find(orderId);\n  if (amountMinor > order.total) {\n    throw new Error('refund exceeds order total');\n  }\n  return gateway.refund(order.transactionId, amountMinor);\n}\n"
+    }
+  ],
+  "expected": [
+    {
+      "path": "src/payments/partial.ts",
+      "line": 6,
+      "description": "compares a minor-unit amount against order.total which is in major units, so the guard passes for refunds up to 100x the order",
+      "severity": "critical"
+    }
+  ],
+  "forbidden": [
+    {
+      "match": "magic number",
+      "why": "there is no literal constant in this change; this flag would be invented"
+    },
+    {
+      "match": "consider extracting",
+      "why": "structural preference with no defect behind it"
+    }
+  ],
+  "stubFindings": [
+    {
+      "path": "src/payments/partial.ts",
+      "line": 6,
+      "severity": "critical",
+      "category": "bug",
+      "title": "Compare amountMinor against a minor-unit total",
+      "body": "`amountMinor` is in minor units but `order.total` is in major units, so any refund under 100x the order total passes this guard.",
+      "evidence": "  if (amountMinor > order.total) {",
+      "ruleIds": ["payments-money-types"],
+      "confidence": 0.93
+    }
+  ]
+}

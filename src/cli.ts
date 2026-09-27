@@ -1,306 +1,328 @@
 #!/usr/bin/env bun
 /**
- * Entry point. Wires the pipeline and owns the process exit code.
+ * Argument parsing, exit codes, and the run summary.
  *
- * target -> diff -> filter -> chunk -> history -> review -> verify -> render
+ * Flags are `--key=value` or `--key value`. There are deliberately no `--no-x`
+ * negation forms: they are the kind of flag that silently becomes a no-op and
+ * nobody notices. Say `--context=off`, not `--no-context`.
  */
 
-import { chunkFiles, filterDiff } from './chunk.ts';
-import { config } from './config.ts';
-import { GeminiError } from './gemini.ts';
-import { enrichChunk } from './history.ts';
-import * as git from './git.ts';
-import { render, renderStatusLine } from './render/terminal.ts';
-import { runReviewPass } from './review.ts';
-import { acquireDiff, confirmTarget, describeTarget, inferTarget } from './target.ts';
-import type { EnrichedChunk, ReviewTarget, Warning } from './types.ts';
-import { runVerifyPass } from './verify.ts';
+import { loadConfig, ConfigError, type Config, type ContextMode, type JudgeMode } from './config.ts';
+import { configureLogger, log } from './logger.ts';
+import { runReview } from './pipeline.ts';
+import { createPlatform } from './platform/index.ts';
+import { loadRules } from './rules/load.ts';
+import { matchCounts } from './rules/match.ts';
+import { Store } from './store/db.ts';
+import type { RunResult, Severity } from './types.ts';
 
-const VERSION = '0.1.0';
+const VERSION = '1.0.0';
 
-const HELP = `aidr — AI diff reviewer
+const USAGE = `aidr ${VERSION} — an LLM code reviewer for GitLab and GitHub
 
-Reviews your local git diff with Gemini. Feeds the model the repository's own
-history of the lines you touched, then makes every finding survive an attempt
-to refute it before you ever see it.
+Usage:
+  aidr review [options]          Review a merge request / pull request
+  aidr rules check [options]     Validate .review rules; non-zero on error
+  aidr runs list [--limit=N]     List recent runs
+  aidr runs show <run-id>        Print one run record in full
 
-USAGE
-  aidr [target] [options]
+Options:
+  --platform=gitlab|github|local   Defaults to the CI environment, else local
+  --project=<id>                   Project id (GitLab) or owner/repo (GitHub)
+  --mr=<iid> | --pr=<number>       Merge request iid / pull request number
+  --base=<ref>                     Local mode: ref to diff against
+  --repo=<path>                    Repository root (default: cwd)
+  --dry-run                        Print findings; post nothing
+  --context=full|diff|off          Context depth (default: full)
+  --judge=on|off                   Second-gate LLM judge (default: on)
+  --model=<id>                     Review model (default: claude-opus-5)
+  --judge-model=<id>               Judge model (default: claude-sonnet-5)
+  --rules-dir=<path>               Rules directory (default: .review)
+  --fail-on=critical|high|medium|low|none
+                                   Exit 1 when a finding at or above this
+                                   severity is posted (default: none)
+  --strict                         Exit 1 on a partial run
+  --log-format=human|json          Log output (default: human)
+  --debug-dir=<path>               Write raw model output here (off by default)
+  --help, --version
 
-TARGET  (inferred from git state when omitted)
-  --staged              review staged changes            (git diff --cached)
-  --working             review the working tree          (git diff)
-  --branch [base]       review this branch vs its base   (git diff base...HEAD)
-  --commit <ref>        review a single commit           (git show ref)
+Exit codes:
+  0  completed (or partial without --strict)
+  1  interrupted, failed, partial with --strict, or --fail-on was met
+`;
 
-OPTIONS
-  -y, --yes             accept the inferred target without prompting
-  -v, --verbose         also show findings that verification discarded
-      --model <name>    model for the review pass    (default ${config.reviewModel})
-      --verify-model <name>
-                        model for the verify pass    (default ${config.verifyModel})
-      --concurrency <n> parallel model calls         (default ${config.concurrency})
-      --max-verify <n>  verification call ceiling    (default ${config.maxVerifyCalls})
-  -h, --help            show this
-      --version         print the version
-
-ENVIRONMENT
-  GEMINI_API_KEY        required — https://aistudio.google.com/apikey
-
-EXIT CODES
-  0  no surviving bug-severity findings
-  1  at least one surviving bug-severity finding
-  2  the tool could not run
-
-Every option has an AIDR_-prefixed environment variable; see src/config.ts.`;
-
-interface Options {
-  target: ReviewTarget | null;
-  yes: boolean;
-  verbose: boolean;
-  help: boolean;
-  version: boolean;
+interface Args {
+  command: string[];
+  flags: Map<string, string | true>;
 }
 
-export function parseArgs(argv: string[]): Options {
-  const options: Options = {
-    target: null,
-    yes: false,
-    verbose: false,
-    help: false,
-    version: false,
-  };
+export function parseArgs(argv: readonly string[]): Args {
+  const command: string[] = [];
+  const flags = new Map<string, string | true>();
 
-  for (let i = 0; i < argv.length; i++) {
-    const arg = argv[i]!;
-    const peek = () => {
-      const next = argv[i + 1];
-      return next && !next.startsWith('-') ? argv[++i] : undefined;
-    };
-
-    switch (arg) {
-      case '--staged':
-        options.target = { kind: 'staged' };
-        break;
-      case '--working':
-        options.target = { kind: 'working' };
-        break;
-      case '--branch':
-        options.target = { kind: 'branch', base: peek() ?? '' };
-        break;
-      case '--commit':
-        options.target = { kind: 'commit', ref: peek() ?? 'HEAD' };
-        break;
-      case '-y':
-      case '--yes':
-        options.yes = true;
-        break;
-      case '-v':
-      case '--verbose':
-        options.verbose = true;
-        break;
-      case '-h':
-      case '--help':
-        options.help = true;
-        break;
-      case '--version':
-        options.version = true;
-        break;
-      case '--model':
-        config.reviewModel = peek() ?? config.reviewModel;
-        break;
-      case '--verify-model':
-        config.verifyModel = peek() ?? config.verifyModel;
-        break;
-      case '--concurrency': {
-        const value = Number(peek());
-        if (Number.isFinite(value) && value > 0) config.concurrency = value;
-        break;
-      }
-      case '--max-verify': {
-        const value = Number(peek());
-        if (Number.isFinite(value) && value >= 0) config.maxVerifyCalls = value;
-        break;
-      }
-      default:
-        throw new Error(`Unknown option: ${arg}\nRun \`aidr --help\`.`);
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index]!;
+    if (!token.startsWith('--')) {
+      command.push(token);
+      continue;
+    }
+    if (token.startsWith('--no-')) {
+      throw new ConfigError(
+        `unsupported flag \`${token}\`. Negation flags are not supported — use an explicit value, e.g. --context=off.`,
+      );
+    }
+    const body = token.slice(2);
+    const eq = body.indexOf('=');
+    if (eq >= 0) {
+      flags.set(body.slice(0, eq), body.slice(eq + 1));
+      continue;
+    }
+    const next = argv[index + 1];
+    if (next !== undefined && !next.startsWith('--')) {
+      flags.set(body, next);
+      index += 1;
+    } else {
+      flags.set(body, true);
     }
   }
 
-  return options;
+  return { command, flags };
 }
 
-function note(message: string): void {
-  process.stderr.write(`${message}\n`);
+function str(flags: Args['flags'], key: string): string | undefined {
+  const value = flags.get(key);
+  return typeof value === 'string' ? value : undefined;
 }
 
-async function main(): Promise<number> {
-  const options = parseArgs(process.argv.slice(2));
+function bool(flags: Args['flags'], key: string): boolean {
+  return flags.get(key) === true || flags.get(key) === 'true';
+}
 
-  if (options.help) {
-    process.stdout.write(`${HELP}\n`);
+function configFrom(args: Args): Config {
+  const { flags } = args;
+  const overrides: Parameters<typeof loadConfig>[1] = {};
+
+  const platform = str(flags, 'platform');
+  if (platform === 'gitlab' || platform === 'github' || platform === 'local') {
+    overrides.platform = platform;
+  }
+  const project = str(flags, 'project');
+  if (project) overrides.projectId = project;
+  const requestId = str(flags, 'mr') ?? str(flags, 'pr');
+  if (requestId) overrides.requestId = requestId;
+  if (bool(flags, 'dry-run')) overrides.dryRun = true;
+  if (bool(flags, 'strict')) overrides.strict = true;
+
+  const context = str(flags, 'context');
+  if (context === 'full' || context === 'diff' || context === 'off') {
+    overrides.context = context as ContextMode;
+  }
+  const judge = str(flags, 'judge');
+  if (judge === 'on' || judge === 'off') overrides.judge = judge as JudgeMode;
+
+  const failOn = str(flags, 'fail-on');
+  if (failOn) overrides.failOn = failOn as Severity | 'none';
+
+  const model = str(flags, 'model');
+  if (model) overrides.reviewModel = model;
+  const judgeModel = str(flags, 'judge-model');
+  if (judgeModel) overrides.judgeModel = judgeModel;
+
+  const logFormat = str(flags, 'log-format');
+  if (logFormat === 'json' || logFormat === 'human') overrides.logFormat = logFormat;
+  const debugDir = str(flags, 'debug-dir');
+  if (debugDir) overrides.debugDir = debugDir;
+  const rulesDir = str(flags, 'rules-dir');
+  if (rulesDir) overrides.rulesDir = rulesDir;
+
+  const cfg = loadConfig(process.env, overrides);
+  // The local adapter cannot post; make that explicit rather than failing late.
+  if (cfg.platform === 'local') cfg.dryRun = true;
+  return cfg;
+}
+
+const SEVERITY_RANK: Record<Severity, number> = { critical: 3, high: 2, medium: 1, low: 0 };
+
+export function exitCodeFor(result: RunResult, cfg: Config): number {
+  if (result.status === 'failed' || result.status === 'interrupted') return 1;
+  if (result.status === 'partial' && cfg.strict) return 1;
+  if (cfg.failOn !== 'none') {
+    const bar = SEVERITY_RANK[cfg.failOn];
+    if (result.findingsPosted.some((finding) => SEVERITY_RANK[finding.severity] >= bar)) return 1;
+  }
+  return 0;
+}
+
+function printFindings(result: RunResult): void {
+  if (result.findingsPosted.length === 0) {
+    process.stdout.write('\nNo findings.\n');
+  }
+  for (const finding of result.findingsPosted) {
+    process.stdout.write(
+      `\n${finding.severity.toUpperCase()} ${finding.category} — ${finding.path}:${finding.line}\n` +
+        `  ${finding.title}\n` +
+        `  ${finding.body.split('\n').join('\n  ')}\n` +
+        (finding.ruleIds.length ? `  rules: ${finding.ruleIds.join(', ')}\n` : '') +
+        `  confidence: ${finding.confidence.toFixed(2)}\n`,
+    );
+  }
+  if (result.findingsDropped.length > 0) {
+    process.stdout.write(`\nDropped before posting (${result.findingsDropped.length}):\n`);
+    for (const finding of result.findingsDropped) {
+      process.stdout.write(`  - ${finding.path}:${finding.line} — ${finding.dropReason}\n`);
+    }
+  }
+}
+
+async function commandReview(args: Args): Promise<number> {
+  const cfg = configFrom(args);
+  configureLogger({ format: cfg.logFormat });
+
+  if (!cfg.anthropicApiKey) {
+    // Not fatal: the SDK also resolves an `ant auth login` profile. But an
+    // unset key is the usual cause of an interrupted run, so say so up front
+    // rather than only in the error list at the end.
+    log.warn(
+      'ANTHROPIC_API_KEY is not set; the SDK will fall back to a stored credential profile',
+      {},
+    );
+  }
+
+  const repoRoot = str(args.flags, 'repo') ?? process.cwd();
+  const localBase = str(args.flags, 'base');
+
+  const result = await runReview(cfg, { repoRoot, localBase });
+
+  printFindings(result);
+  process.stdout.write(
+    `\nstatus=${result.status} reviewed=${result.filesReviewed.length} ` +
+      `skipped=${result.filesSkipped.length} posted=${result.findingsPosted.length} ` +
+      `dropped=${result.findingsDropped.length} cost=$${result.costUsd.toFixed(4)} ` +
+      `run=${result.runId}\n`,
+  );
+  for (const entry of result.degradations) process.stdout.write(`  degraded: ${entry}\n`);
+  for (const entry of result.errors) process.stdout.write(`  error [${entry.stage}]: ${entry.message}\n`);
+
+  return exitCodeFor(result, cfg);
+}
+
+async function commandRulesCheck(args: Args): Promise<number> {
+  const cfg = configFrom(args);
+  configureLogger({ format: cfg.logFormat });
+
+  const repoRoot = str(args.flags, 'repo') ?? process.cwd();
+  const platform = createPlatform(cfg, { repoRoot, localBase: str(args.flags, 'base') });
+
+  const result = await loadRules(platform, {
+    rulesDir: cfg.rulesDir,
+    fileMaxBytes: cfg.ruleFileMaxBytes,
+    totalMaxBytes: cfg.ruleTotalMaxBytes,
+  });
+
+  const paths = await platform.listTargetBranchTree('').catch(() => []);
+  const counts = matchCounts(result.rules, paths);
+
+  process.stdout.write(`Loaded ${result.rules.length} rule(s) from ${cfg.rulesDir}\n`);
+  for (const rule of result.rules) {
+    const scope = rule.global ? 'global' : rule.globs.join(', ');
+    const matched = counts.get(rule.id) ?? 0;
+    const warning = !rule.global && matched === 0 ? '  <-- matches nothing' : '';
+    process.stdout.write(
+      `  ${rule.id}  [${scope}]  severity=${rule.severity} priority=${rule.priority} matches=${matched}${warning}\n`,
+    );
+  }
+
+  for (const dropped of result.dropped) {
+    process.stderr.write(`dropped: ${dropped.sourcePath} (${dropped.id}) — ${dropped.reason}\n`);
+  }
+  for (const error of result.errors) {
+    process.stderr.write(`error: ${error.sourcePath} — ${error.message}\n`);
+  }
+
+  const unmatched = result.rules.filter(
+    (rule) => !rule.global && (counts.get(rule.id) ?? 0) === 0,
+  );
+  if (unmatched.length > 0) {
+    process.stderr.write(
+      `error: ${unmatched.length} scoped rule(s) match no file in the repository\n`,
+    );
+  }
+
+  return result.errors.length > 0 || result.dropped.length > 0 || unmatched.length > 0 ? 1 : 0;
+}
+
+function commandRuns(args: Args): number {
+  const cfg = configFrom(args);
+  const store = new Store(cfg.stateDbPath);
+  const [, sub, runId] = args.command;
+
+  if (sub === 'show') {
+    if (!runId) {
+      process.stderr.write('usage: aidr runs show <run-id>\n');
+      return 1;
+    }
+    const run = store.getRun(runId);
+    if (!run) {
+      process.stderr.write(`no run with id ${runId}\n`);
+      return 1;
+    }
+    process.stdout.write(`${JSON.stringify(run, null, 2)}\n`);
     return 0;
   }
-  if (options.version) {
+
+  const limit = Number(str(args.flags, 'limit') ?? 20);
+  for (const run of store.listRuns(Number.isFinite(limit) ? limit : 20)) {
+    process.stdout.write(
+      `${run.createdAt}  ${run.status.padEnd(11)}  ${run.headSha.slice(0, 10)}  ${run.runId}\n`,
+    );
+  }
+  return 0;
+}
+
+export async function main(argv: readonly string[]): Promise<number> {
+  let args: Args;
+  try {
+    args = parseArgs(argv);
+  } catch (err) {
+    process.stderr.write(`${err instanceof Error ? err.message : String(err)}\n`);
+    return 1;
+  }
+
+  if (args.flags.has('help') || args.command.length === 0) {
+    process.stdout.write(USAGE);
+    return args.command.length === 0 && !args.flags.has('help') ? 1 : 0;
+  }
+  if (args.flags.has('version')) {
     process.stdout.write(`${VERSION}\n`);
     return 0;
   }
 
-  if (!(await git.isGitRepo())) {
-    note('Not a git repository. aidr reads diffs from local git.');
-    return 2;
-  }
-  if (!(await git.hasCommits())) {
-    note('This repository has no commits yet, so there is no diff to review.');
-    return 2;
-  }
-
-  // --- Target -------------------------------------------------------------
-  let target: ReviewTarget;
-  if (options.target) {
-    target = await resolveExplicitTarget(options.target);
-  } else {
-    const inferred = await inferTarget();
-    if (!inferred) {
-      note('Nothing to review: no staged changes, a clean working tree, and no branch to compare.');
-      return 0;
+  try {
+    switch (args.command[0]) {
+      case 'review':
+        return await commandReview(args);
+      case 'rules':
+        if (args.command[1] !== 'check') {
+          process.stderr.write('usage: aidr rules check\n');
+          return 1;
+        }
+        return await commandRulesCheck(args);
+      case 'runs':
+        return commandRuns(args);
+      default:
+        process.stderr.write(`unknown command: ${args.command[0]}\n\n${USAGE}`);
+        return 1;
     }
-    target = await confirmTarget(inferred, { yes: options.yes });
+  } catch (err) {
+    if (err instanceof ConfigError) {
+      process.stderr.write(`configuration error:\n${err.message}\n`);
+      return 1;
+    }
+    log.error('unhandled failure', { error: err instanceof Error ? err.stack : String(err) });
+    return 1;
   }
-
-  // --- Diff, filter, chunk ------------------------------------------------
-  const rawDiff = await acquireDiff(target);
-  if (!rawDiff.trim()) {
-    note(`Nothing to review: ${describeTarget(target)} produced an empty diff.`);
-    return 0;
-  }
-
-  const { files, excluded } = filterDiff(rawDiff);
-  if (files.length === 0) {
-    note(
-      `Nothing to review: all ${excluded.length} changed file(s) were excluded ` +
-        `(${[...new Set(excluded.map((f) => f.reason))].join(', ')}).`,
-    );
-    return 0;
-  }
-
-  const chunks = chunkFiles(files);
-  process.stdout.write(`${renderStatusLine({ target, filesReviewed: files.length })}\n`);
-
-  // --- History ------------------------------------------------------------
-  const warnings: Warning[] = [];
-  const enriched: EnrichedChunk[] = await Promise.all(
-    chunks.map(async (chunk) => {
-      try {
-        return { chunk, history: await enrichChunk(chunk) };
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        warnings.push({ stage: 'history', path: chunk.path, message });
-        return {
-          chunk,
-          history: {
-            path: chunk.path,
-            available: false,
-            unavailableReason: 'history lookup failed',
-            commits: [],
-            blame: [],
-            totalCommits: 0,
-            recentCommits: 0,
-            priorFixes: [],
-            reverts: [],
-            daysSinceLastTouch: null,
-            distinctBlameCommits: 0,
-          },
-        };
-      }
-    }),
-  );
-
-  // --- Review -------------------------------------------------------------
-  const progress = makeProgress();
-  const review = await runReviewPass(enriched, config.concurrency, (done, total) =>
-    progress(`reviewing ${done}/${total} chunk(s)`),
-  );
-  warnings.push(...review.warnings);
-
-  // --- Verify -------------------------------------------------------------
-  const contextByFile = new Map<string, string>();
-  for (const chunk of chunks) {
-    const existing = contextByFile.get(chunk.path);
-    contextByFile.set(chunk.path, existing ? `${existing}\n${chunk.patch}` : chunk.patch);
-  }
-
-  const verify = await runVerifyPass(
-    review.findings,
-    contextByFile,
-    config.concurrency,
-    config.maxVerifyCalls,
-    (done, total) => progress(`verifying ${done}/${total} finding(s)`),
-  );
-  warnings.push(...verify.warnings);
-  progress.clear();
-
-  // --- Render -------------------------------------------------------------
-  process.stdout.write(
-    `${render(
-      {
-        target,
-        findings: verify.findings,
-        excluded,
-        warnings,
-        filesReviewed: files.length,
-        chunksReviewed: chunks.length,
-        verifyCallsUsed: verify.callsUsed,
-      },
-      { verbose: options.verbose },
-    )}\n`,
-  );
-
-  const blocking = verify.findings.some(
-    (finding) => finding.severity === 'bug' && finding.verdict !== 'discarded',
-  );
-  return blocking ? 1 : 0;
-}
-
-/** Validate a target the user asked for explicitly, filling in defaults. */
-async function resolveExplicitTarget(target: ReviewTarget): Promise<ReviewTarget> {
-  if (target.kind === 'branch' && !target.base) {
-    const base = await git.defaultBranch();
-    if (!base) throw new Error('Could not determine a default branch. Pass one: --branch main');
-    return { kind: 'branch', base };
-  }
-  if (target.kind === 'branch' && !(await git.resolveRef(target.base))) {
-    throw new Error(`Base ref not found: ${target.base}`);
-  }
-  if (target.kind === 'commit' && !(await git.resolveRef(target.ref))) {
-    throw new Error(`Commit not found: ${target.ref}`);
-  }
-  return target;
-}
-
-/** A single-line status indicator that stays out of the way when piped. */
-function makeProgress() {
-  const active = Boolean(process.stderr.isTTY);
-  let width = 0;
-
-  const write = (message: string) => {
-    if (!active) return;
-    process.stderr.write(`\r${message.padEnd(width)}`);
-    width = Math.max(width, message.length);
-  };
-  write.clear = () => {
-    if (active && width > 0) process.stderr.write(`\r${' '.repeat(width)}\r`);
-  };
-  return write;
 }
 
 if (import.meta.main) {
-  try {
-    process.exit(await main());
-  } catch (err) {
-    if (err instanceof GeminiError) note(err.message);
-    else if (err instanceof git.GitError) note(err.message);
-    else note(err instanceof Error ? err.message : String(err));
-    process.exit(2);
-  }
+  process.exit(await main(process.argv.slice(2)));
 }
