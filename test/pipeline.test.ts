@@ -8,6 +8,7 @@ import { runReview } from '../src/pipeline.ts';
 import { Store } from '../src/store/db.ts';
 import { exitCodeFor } from '../src/cli.ts';
 import { configureLogger } from '../src/logger.ts';
+import { JevJudge } from '../src/review/jev.ts';
 import { makeFakePlatform, makeFakeReviewer } from './helpers.ts';
 
 configureLogger({ quiet: true });
@@ -196,6 +197,43 @@ describe('runReview', () => {
 
     expect(platform.inline).toHaveLength(0);
     expect(result.findingsDropped[0]!.dropReason).toContain('judge:');
+  });
+
+  test('a decision-model judge is recorded on the run and billed separately', async () => {
+    const platform = makeFakePlatform({ changeSet: changeSet() });
+    const jev = new JevJudge(
+      { model: 'jev-1.13', apiKey: 'k', endpoint: 'https://example.test' },
+      {
+        async post() {
+          return {
+            id: 'gen-dec-1',
+            model: 'jev-1.13',
+            answers: {
+              real: { type: 'noul', noul: 0.97 },
+              changed: { type: 'noul', noul: 0.91 },
+              specific: { type: 'noul', noul: 0.84 },
+              action: { type: 'score', score: 1.9 },
+            } as never,
+            usage: { input_tokens: 950, output_tokens: 70, cost: 0.00004 },
+          };
+        },
+      },
+    );
+
+    const result = await runReview(config({ judge: 'on' }), {
+      repoRoot: '.',
+      platform,
+      store: new Store(':memory:'),
+      runner: makeFakeReviewer({ findings: [goodFinding()] }),
+      judge: jev,
+    });
+
+    expect(platform.inline).toHaveLength(1);
+    expect(result.judgeModel).toBe('jev-1.13');
+    // The fake reviewer reports no cost, so the whole bill is the judge's.
+    expect(result.costUsd).toBeCloseTo(0.00004, 9);
+    expect(result.findingsPosted[0]!.calibratedConfidence).toBeCloseTo(0.84, 5);
+    expect(platform.inline[0]!.body).toContain('calibrated');
   });
 
   test('--fail-on turns a posted critical finding into a non-zero exit', async () => {

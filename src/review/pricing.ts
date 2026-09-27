@@ -24,6 +24,13 @@ export const PRICING: Record<string, ModelPrice> = {
   // Sonnet 5 introductory pricing ($2/$10) ended 2026-08-31; standard rate applies.
   'claude-sonnet-5': { inputPerMTok: 3, outputPerMTok: 15, contextTokens: 1_000_000 },
   'claude-haiku-4-5': { inputPerMTok: 1, outputPerMTok: 5, contextTokens: 200_000 },
+
+  // TypeSafe "System One" decision models. Output is unmetered because they
+  // emit no tokens — a typed answer, not prose. Early access: treat these
+  // figures as provisional and prefer the `usage.cost` the API reports.
+  'jev-latest': { inputPerMTok: 0.042, outputPerMTok: 0, contextTokens: 32_000 },
+  'jev-1.13': { inputPerMTok: 0.042, outputPerMTok: 0, contextTokens: 32_000 },
+  'typesafe/jev-1.13': { inputPerMTok: 0.042, outputPerMTok: 0, contextTokens: 32_000 },
 };
 
 /** Cache reads bill at ~0.1x input; 5-minute cache writes at ~1.25x input. */

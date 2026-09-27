@@ -76,7 +76,7 @@ intake ──► rules ──► context ──► cache ──► review ──
 | cache | [`src/store/db.ts`](src/store/db.ts) | Keyed on content hash + rules hash + prompt version + model — never on path |
 | review | [`src/review/run.ts`](src/review/run.ts) | Structured outputs; a schema miss is a failed call, never "zero findings" |
 | verify | [`src/review/verify.ts`](src/review/verify.ts) | Path, line-in-hunk, verbatim evidence, praise, confidence, duplicates |
-| judge | [`src/review/judge.ts`](src/review/judge.ts) | One finding per call, **with the surrounding code** and any cited rule |
+| judge | [`src/review/judge.ts`](src/review/judge.ts) | One finding per call, **with the surrounding code** and any cited rule; Claude or a decision model |
 | publish | [`src/publish/comments.ts`](src/publish/comments.ts) | Fingerprinted identity, idempotent posting, one summary edited in place |
 
 ### Exit codes
@@ -106,7 +106,9 @@ identically. CLI flags override the environment.
 | `REVIEWER_PROJECT_ID` | CI variable | Project id, or `owner/repo` |
 | `REVIEWER_MR_IID` | CI variable | MR iid / PR number |
 | `REVIEWER_REVIEW_MODEL` | `claude-opus-5` | Review pass |
-| `REVIEWER_JUDGE_MODEL` | `claude-sonnet-5` | Gate two |
+| `REVIEWER_JUDGE_MODEL` | `claude-sonnet-5` | Gate two; `jev-1.13` switches backend (see below) |
+| `REVIEWER_JEV_API_KEY` | `TYPESAFE_API_KEY`, `OPENROUTER_API_KEY` | Only when the judge is a Jev model |
+| `REVIEWER_JEV_ENDPOINT` | `https://api.typesafe.ai/v1/systemone` | Or OpenRouter / Cloudflare |
 | `REVIEWER_FALLBACK_MODEL` | `claude-opus-4-8` | Used only on a refusal; `none` to disable |
 | `REVIEWER_REVIEW_EFFORT` | `xhigh` | `low`…`max` |
 | `REVIEWER_BUDGET_USD` | `2` | Hard per-run ceiling; posts what it has and marks the run partial |
@@ -150,6 +152,80 @@ single-currency module.
 This repository dogfoods its own rules in [`.review/`](.review/).
 
 ---
+
+## Gate two can run on a decision model (experimental)
+
+Gate two asks four bounded questions — is this real, is it about the changed
+lines, is it specific, is it worth acting on. That is a classification problem,
+not a generation problem, so it can run on a *decision model*:
+[TypeSafe's Jev](https://openrouter.ai/docs/guides/community/jev) answers all
+four in one round trip and returns **calibrated** probabilities.
+
+```bash
+REVIEWER_JUDGE_MODEL=jev-1.13 TYPESAFE_API_KEY=… bun run src/cli.ts review
+```
+
+| | `claude-sonnet-5` | `jev-1.13` |
+|---|---|---|
+| Per judged finding | ~$0.006 | ~$0.00004 |
+| Latency | seconds | 70–500 ms |
+| Output | one prose verdict | four probabilities, calibrated |
+| Signal on a drop | a sentence | the failing condition and its value |
+
+Three things this actually buys:
+
+1. **Four signals instead of one.** A drop names the condition that failed —
+   `jev: pre-existing rather than introduced here (changed=0.28)` — rather than
+   one opaque keep/drop.
+2. **Calibrated confidence.** The review model's `confidence` is *self-reported*
+   and uncalibrated; a decision model's probability is calibrated by
+   construction. Findings carry both, labelled, and the comment footer says
+   which is which.
+3. **No instruction channel.** The judge receives a state object and picks from
+   a fixed schema — there is no prose for text inside a diff to hijack.
+
+What it costs you: **no natural-language rationale**. Synthesising the reason
+from the failing condition recovers most of it, but not all.
+
+### Read the claims carefully
+
+Jev is advertised as ~200× faster and ~400× cheaper than frontier models. Both
+are true *per classification call*, and neither is what your bill looks like.
+The review pass — which Jev structurally **cannot** do, because findings need a
+generated title, body and verbatim evidence — dominates the cost:
+
+| | today | with a Jev judge |
+|---|---|---|
+| Review pass (Opus 5) | $0.40 | $0.40 |
+| Judge, 20 findings | $0.12 | $0.0008 |
+| **Per merge request** | **~$0.52** | **~$0.40** |
+
+So: about a fifth off the bill, plus ~25 s of wall clock. The real gain is that
+verification you could not previously justify becomes free — more conditions per
+finding, and an always-on semantic matcher in the evals instead of token overlap.
+
+Also worth keeping straight: "never hallucinates" means **output is always
+in-schema** (0% structured-output error), not that answers are correct. A
+confidently wrong `drop` silently kills a real bug, which is precisely why this
+is off by default and gated on measurement. TypeSafe's own benchmark puts Jev at
+67.8% against GPT-5.6 Terra's 67.9% on four workflows — nothing about code-review
+judging, and gate two arguably needs System *Two* reasoning.
+
+**So measure it before trusting it.** That is what the harness is for:
+
+```bash
+bun run evals --reviewer=model --judge=off
+bun run evals --reviewer=model --judge=claude-sonnet-5
+bun run evals --reviewer=model --judge=jev-1.13
+```
+
+Compare precision and noise/case on the **holdout** half. Adopt only if
+precision holds. Same discipline as gating the context engine on measurement.
+
+One thing deliberately *not* built: Jev is a tempting fit for triaging which
+files to review, and that is the reference tool's worst bug — an allow-list that
+silently drops files and reports them as reviewed. Cheap inference does not fix
+that; it just makes a bad idea affordable.
 
 ## Evals
 
@@ -259,7 +335,7 @@ Use a bot account whose token can comment but cannot approve or merge.
 ## Development
 
 ```bash
-bun test              # 79 tests
+bun test              # 101 tests
 bunx tsc --noEmit     # strict, no implicit any, no unchecked index access
 bun run evals         # offline
 bun run src/cli.ts rules check

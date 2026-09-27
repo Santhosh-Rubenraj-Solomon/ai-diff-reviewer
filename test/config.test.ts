@@ -50,6 +50,24 @@ describe('loadConfig', () => {
     expect(priceUsd('claude-made-up-9', { inputTokens: 1000, outputTokens: 1000 })).toBeNull();
   });
 
+  test('a Jev judge without a key fails at config time, not mid-run', () => {
+    expect(() => loadConfig({}, { judgeModel: 'jev-1.13', judge: 'on' })).toThrow(/Jev judge/);
+  });
+
+  test('a Jev judge accepts any of the three key variables', () => {
+    for (const key of ['REVIEWER_JEV_API_KEY', 'TYPESAFE_API_KEY', 'OPENROUTER_API_KEY']) {
+      const cfg = loadConfig({ [key]: 'k' }, { judgeModel: 'jev-1.13', judge: 'on' });
+      expect(cfg.jev.apiKey).toBe('k');
+    }
+  });
+
+  test('Jev prices input only — output is unmetered', () => {
+    expect(priceUsd('jev-1.13', { inputTokens: 1_000_000, outputTokens: 500_000 })).toBeCloseTo(
+      0.042,
+      6,
+    );
+  });
+
   test('a known model prices from the table', () => {
     expect(priceUsd('claude-opus-5', { inputTokens: 1_000_000, outputTokens: 0 })).toBeCloseTo(5, 6);
   });

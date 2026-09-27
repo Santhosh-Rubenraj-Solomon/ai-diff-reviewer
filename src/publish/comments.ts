@@ -102,7 +102,13 @@ export function renderFindingBody(finding: Finding): string {
     parts.push('', '<details><summary>Suggested change</summary>', '', '```', finding.suggestion, '```', '', '</details>');
   }
 
-  const meta: string[] = [`confidence ${finding.confidence.toFixed(2)}`];
+  const meta: string[] =
+    finding.calibratedConfidence === undefined
+      ? [`confidence ${finding.confidence.toFixed(2)} (self-reported)`]
+      : [
+          `confidence ${finding.calibratedConfidence.toFixed(2)} (calibrated)`,
+          `self-reported ${finding.confidence.toFixed(2)}`,
+        ];
   if (finding.ruleIds.length > 0) meta.push(`rules: ${finding.ruleIds.join(', ')}`);
   if (finding.lineCorrectedFrom !== undefined) {
     meta.push(`line corrected from ${finding.lineCorrectedFrom}`);
@@ -165,7 +171,8 @@ export function renderSummary(result: RunResult, changeSet: ChangeSet): string {
     '',
     '<details><summary>Run detail</summary>',
     '',
-    `- model: \`${result.model}\` · prompt \`${result.promptVersion}\` · rules \`${result.rulesHash.slice(0, 8)}\``,
+    `- model: \`${result.model}\` · judge: \`${result.judgeModel ?? 'off'}\``,
+    `- prompt \`${result.promptVersion}\` · rules \`${result.rulesHash.slice(0, 8)}\``,
     `- cost: $${result.costUsd.toFixed(4)} · duration: ${(result.durationMs / 1000).toFixed(1)}s`,
     `- findings dropped before posting: ${result.findingsDropped.length}`,
     `- run id: \`${result.runId}\``,

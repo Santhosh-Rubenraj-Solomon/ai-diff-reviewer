@@ -27,7 +27,8 @@ import {
 } from './review/run.ts';
 import { contextWindow } from './review/pricing.ts';
 import { verifyFindings } from './review/verify.ts';
-import { judgeFindings } from './review/judge.ts';
+import { ClaudeJudge, judgeFindings, type Judge } from './review/judge.ts';
+import { JevJudge, isJevModel } from './review/jev.ts';
 import { publishFindings, renderSummary, upsertSummary } from './publish/comments.ts';
 import { Store } from './store/db.ts';
 import { describeSkip } from './diff/filter.ts';
@@ -41,6 +42,8 @@ export interface RunOptions {
   platform?: Platform;
   runner?: Reviewer;
   store?: Store;
+  /** Injected in tests; otherwise selected from `cfg.judgeModel`. */
+  judge?: Judge;
 }
 
 export async function runReview(cfg: Config, opts: RunOptions): Promise<RunResult> {
@@ -84,6 +87,7 @@ export async function runReview(cfg: Config, opts: RunOptions): Promise<RunResul
       costUsd: 0,
       started,
       rulesHash: '',
+      judgeModel: null,
       store,
     });
   }
@@ -140,6 +144,7 @@ export async function runReview(cfg: Config, opts: RunOptions): Promise<RunResul
       costUsd: 0,
       started,
       rulesHash: ruleResult.rulesHash,
+      judgeModel: null,
       store,
     });
     await postSummary(result, changeSet, { platform, store, cfg }).catch((err) =>
@@ -351,10 +356,12 @@ export async function runReview(cfg: Config, opts: RunOptions): Promise<RunResul
   let kept = verified.kept;
   const dropped = [...verified.dropped];
 
-  if (cfg.judge === 'on' && kept.length > 0) {
+  const judge = cfg.judge === 'on' ? (opts.judge ?? selectJudge(cfg, runner)) : null;
+
+  if (judge && kept.length > 0) {
     try {
       const judged = await timed('judge', () =>
-        judgeFindings(kept, changeSet, ruleResult.rules, runner, cfg.concurrency),
+        judgeFindings(kept, changeSet, ruleResult.rules, judge, cfg.concurrency),
       );
       kept = judged.kept;
       dropped.push(...judged.dropped);
@@ -364,9 +371,11 @@ export async function runReview(cfg: Config, opts: RunOptions): Promise<RunResul
       }
       log.stage({
         stage: 'judge',
+        backend: judge.name,
         kept: judged.kept.length,
         dropped: judged.dropped.length,
         errors: judged.errors,
+        costUsd: judge.usage.costUsd,
       });
     } catch (err) {
       fail('judge', message(err));
@@ -412,9 +421,12 @@ export async function runReview(cfg: Config, opts: RunOptions): Promise<RunResul
     dropped,
     reviewedPaths: [...new Set(reviewedPaths)],
     skipped,
-    costUsd: runner.usage.costUsd,
+    // The judge may run on a separate backend with its own bill; a Claude
+    // judge reports zero here because the runner already counted it.
+    costUsd: runner.usage.costUsd + (judge?.usage.costUsd ?? 0),
     started,
     rulesHash: ruleResult.rulesHash,
+    judgeModel: judge?.name ?? null,
     store,
   });
 
@@ -464,6 +476,7 @@ interface FinishInput {
   costUsd: number;
   started: number;
   rulesHash: string;
+  judgeModel: string | null;
   store: Store;
 }
 
@@ -476,6 +489,7 @@ function finish(input: FinishInput): RunResult {
     requestId: input.changeSet?.requestId ?? input.cfg.requestId,
     headSha: input.changeSet?.headSha ?? '',
     model: input.cfg.reviewModel,
+    judgeModel: input.judgeModel,
     promptVersion: input.cfg.promptVersion,
     rulesHash: input.rulesHash,
     filesReviewed: input.reviewedPaths,
@@ -489,6 +503,24 @@ function finish(input: FinishInput): RunResult {
   };
   input.store.saveRun(result);
   return result;
+}
+
+/**
+ * Gate two's backend, chosen from the model id.
+ *
+ * A decision model answers the four gate conditions directly and returns
+ * calibrated probabilities; a generative model answers in prose. Both satisfy
+ * `Judge`, and which one ran is recorded on the run.
+ */
+export function selectJudge(cfg: Config, runner: Reviewer): Judge {
+  if (isJevModel(cfg.judgeModel)) {
+    return new JevJudge({
+      model: cfg.judgeModel,
+      apiKey: cfg.jev.apiKey ?? '',
+      endpoint: cfg.jev.endpoint,
+    });
+  }
+  return new ClaudeJudge(runner, cfg.judgeModel);
 }
 
 const ORDER: Record<RunStatus, number> = {

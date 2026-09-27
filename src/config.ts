@@ -9,6 +9,7 @@
 import { z } from 'zod';
 import type { PlatformName, Severity } from './types.ts';
 import { isPriced } from './review/pricing.ts';
+import { isJevModel } from './review/jev.ts';
 
 export const PROMPT_VERSION = 'v1';
 
@@ -27,6 +28,12 @@ export interface Config {
   judgeModel: string;
   /** Retried here when the review model declines a request. Never silent. */
   fallbackModel: string | null;
+
+  /** Set when `judgeModel` names a TypeSafe decision model. */
+  jev: {
+    endpoint: string;
+    apiKey: string | null;
+  };
   reviewEffort: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
   judgeEffort: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
   maxTokens: number;
@@ -71,6 +78,10 @@ const EnvSchema = z.object({
   REVIEWER_REVIEW_MODEL: z.string().optional(),
   REVIEWER_JUDGE_MODEL: z.string().optional(),
   REVIEWER_FALLBACK_MODEL: z.string().optional(),
+  REVIEWER_JEV_ENDPOINT: z.string().optional(),
+  REVIEWER_JEV_API_KEY: z.string().optional(),
+  TYPESAFE_API_KEY: z.string().optional(),
+  OPENROUTER_API_KEY: z.string().optional(),
   REVIEWER_REVIEW_EFFORT: z.enum(EFFORTS).optional(),
   REVIEWER_JUDGE_EFFORT: z.enum(EFFORTS).optional(),
 
@@ -179,6 +190,12 @@ export function loadConfig(
     // frontier models; a declined batch is retried here and reported.
     fallbackModel:
       e.REVIEWER_FALLBACK_MODEL === 'none' ? null : (e.REVIEWER_FALLBACK_MODEL ?? 'claude-opus-4-8'),
+    jev: {
+      // Reachable three ways (TypeSafe direct, OpenRouter, Cloudflare) and in
+      // early access, so the endpoint is configuration rather than a constant.
+      endpoint: e.REVIEWER_JEV_ENDPOINT ?? 'https://api.typesafe.ai/v1/systemone',
+      apiKey: e.REVIEWER_JEV_API_KEY ?? e.TYPESAFE_API_KEY ?? e.OPENROUTER_API_KEY ?? null,
+    },
     reviewEffort: e.REVIEWER_REVIEW_EFFORT ?? 'xhigh',
     judgeEffort: e.REVIEWER_JUDGE_EFFORT ?? 'low',
     // Generous on purpose: thinking is on by default on the 5-family and shares
@@ -227,6 +244,11 @@ function validate(cfg: Config): void {
     problems.push('REVIEWER_CONFIDENCE must be between 0 and 1');
   }
   if (cfg.budgetUsd <= 0) problems.push('REVIEWER_BUDGET_USD must be greater than 0');
+  if (cfg.judge === 'on' && isJevModel(cfg.judgeModel) && !cfg.jev.apiKey) {
+    problems.push(
+      'a Jev judge needs REVIEWER_JEV_API_KEY (or TYPESAFE_API_KEY / OPENROUTER_API_KEY)',
+    );
+  }
 
   if (problems.length > 0) {
     throw new ConfigError(problems.join('\n'));

@@ -100,8 +100,13 @@ export interface Finding {
   suggestion?: string;
   /** Which rules produced this finding — the unit of per-rule measurement. */
   ruleIds: string[];
-  /** Model-reported, 0..1. */
+  /** Model-reported, 0..1. Self-assessed, and not calibrated. */
   confidence: number;
+  /**
+   * Set when the judge backend reports a calibrated probability (a decision
+   * model does; a generative model's self-report does not count).
+   */
+  calibratedConfidence?: number;
   verdict?: 'kept' | 'dropped';
   dropReason?: string;
   /** Set when verify.ts corrected a line number that was off but recoverable. */
@@ -124,6 +129,8 @@ export interface RunResult {
   requestId: string;
   headSha: string;
   model: string;
+  /** The gate-two backend, or null when the judge was off. */
+  judgeModel: string | null;
   promptVersion: string;
   rulesHash: string;
   filesReviewed: string[];

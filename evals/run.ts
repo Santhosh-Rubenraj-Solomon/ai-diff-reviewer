@@ -10,6 +10,13 @@
  *   bun run evals --reviewer=model         real review pass (sync)
  *   bun run evals --reviewer=model --mode=batch    via the Batch API (50% cheaper)
  *   bun run evals --split=holdout          report on the held-out half only
+ *
+ * Comparing gate-two backends on the same fixtures — the measurement that
+ * decides whether a decision model can do this job:
+ *
+ *   bun run evals --reviewer=model --judge=off
+ *   bun run evals --reviewer=model --judge=claude-sonnet-5
+ *   bun run evals --reviewer=model --judge=jev-1.13
  */
 
 import Anthropic from '@anthropic-ai/sdk';
@@ -26,6 +33,7 @@ import { ReviewSchema, clampFinding } from '../src/review/schema.ts';
 import { ReviewRunner } from '../src/review/run.ts';
 import { verifyFindings } from '../src/review/verify.ts';
 import { judgeFindings } from '../src/review/judge.ts';
+import { selectJudge } from '../src/pipeline.ts';
 import { withFingerprint } from '../src/publish/fingerprint.ts';
 import { priceUsd } from '../src/review/pricing.ts';
 import { mapPool } from '../src/pool.ts';
@@ -42,7 +50,8 @@ interface Options {
   mode: 'sync' | 'batch';
   split: 'all' | 'train' | 'holdout';
   limit: number;
-  judge: 'on' | 'off';
+  /** `off`, or the model id of the gate-two backend to measure. */
+  judge: string;
   out: string | null;
 }
 
@@ -58,7 +67,7 @@ function parseOptions(argv: readonly string[]): Options {
     mode: (flags.get('mode') as Options['mode']) ?? 'sync',
     split: (flags.get('split') as Options['split']) ?? 'all',
     limit: Number(flags.get('limit') ?? Number.MAX_SAFE_INTEGER),
-    judge: (flags.get('judge') as Options['judge']) ?? 'off',
+    judge: flags.get('judge') ?? 'off',
     out: flags.get('out') ?? null,
   };
 }
@@ -93,7 +102,13 @@ async function main(): Promise<number> {
 
   const cfg = loadConfig(
     { ...process.env, REVIEWER_PLATFORM: 'local' },
-    { platform: 'local', dryRun: true, judge: options.judge, context: 'diff' },
+    {
+      platform: 'local',
+      dryRun: true,
+      context: 'diff',
+      judge: options.judge === 'off' ? 'off' : 'on',
+      ...(options.judge === 'off' ? {} : { judgeModel: options.judge }),
+    },
   );
 
   const scores: CaseScore[] =
@@ -152,10 +167,13 @@ async function runStub(cases: EvalCase[]): Promise<CaseScore[]> {
 
 async function runSync(cases: EvalCase[], cfg: ReturnType<typeof loadConfig>): Promise<CaseScore[]> {
   const runner = new ReviewRunner(cfg);
+  // Whichever gate-two backend the variant names — the whole point of the
+  // comparison is that both are measured on identical fixtures.
+  const judge = cfg.judge === 'on' ? selectJudge(cfg, runner) : null;
 
   return await mapPool(cases, 2, async (evalCase) => {
     const started = performance.now();
-    const costBefore = runner.usage.costUsd;
+    const costBefore = runner.usage.costUsd + (judge?.usage.costUsd ?? 0);
     const changeSet = toChangeSet(evalCase);
 
     const selection = await selectContext(changeSet, [], emptySnapshot('evals'), null, {
@@ -182,12 +200,12 @@ async function runSync(cases: EvalCase[], cfg: ReturnType<typeof loadConfig>): P
       confidenceThreshold: cfg.confidenceThreshold,
     });
     let kept = verified.kept;
-    if (cfg.judge === 'on') {
-      kept = (await judgeFindings(kept, changeSet, [], runner, 2)).kept;
+    if (judge) {
+      kept = (await judgeFindings(kept, changeSet, [], judge, 2)).kept;
     }
 
     return await scoreCase(evalCase, kept, {
-      costUsd: runner.usage.costUsd - costBefore,
+      costUsd: runner.usage.costUsd + (judge?.usage.costUsd ?? 0) - costBefore,
       durationMs: Math.round(performance.now() - started),
     });
   });
