@@ -116,3 +116,45 @@ export function makeFakeReviewer(opts: FakeReviewerOptions = {}): Reviewer & { c
     },
   };
 }
+
+export interface FetchCall {
+  url: string;
+  method: string;
+  headers: Record<string, string>;
+  body: string | null;
+}
+
+/**
+ * Replaces `globalThis.fetch` with a router. Returns the recorded calls and a
+ * `restore` to put the real fetch back. No test ever reaches the network.
+ */
+export function mockFetch(
+  route: (url: string, init: RequestInit) => Response | Promise<Response>,
+): { calls: FetchCall[]; restore: () => void } {
+  const original = globalThis.fetch;
+  const calls: FetchCall[] = [];
+  const fake = async (input: string | URL | Request, init: RequestInit = {}): Promise<Response> => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+    calls.push({
+      url,
+      method: init.method ?? 'GET',
+      headers: { ...((init.headers as Record<string, string> | undefined) ?? {}) },
+      body: typeof init.body === 'string' ? init.body : null,
+    });
+    return await route(url, init);
+  };
+  globalThis.fetch = fake as unknown as typeof fetch;
+  return {
+    calls,
+    restore: () => {
+      globalThis.fetch = original;
+    },
+  };
+}
+
+export function jsonResponse(body: unknown, init: { status?: number; headers?: Record<string, string> } = {}): Response {
+  return new Response(JSON.stringify(body), {
+    status: init.status ?? 200,
+    headers: { 'content-type': 'application/json', ...(init.headers ?? {}) },
+  });
+}
