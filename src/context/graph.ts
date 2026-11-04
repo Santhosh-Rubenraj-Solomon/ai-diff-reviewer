@@ -23,6 +23,8 @@ export interface ImportGraph {
   unresolvedImports: number;
   analyzedFiles: number;
   analyzerNames: string[];
+  /** Named degradations, e.g. a tsconfig that exists but could not be parsed. */
+  degradations?: string[];
 }
 
 export interface TsconfigPaths {
@@ -30,26 +32,85 @@ export interface TsconfigPaths {
   paths: Record<string, string[]>;
 }
 
-/** Reads `compilerOptions.baseUrl` / `paths` if a tsconfig is present. */
-export async function readTsconfigPaths(snapshot: RepoSnapshot): Promise<TsconfigPaths | null> {
+/**
+ * Strips `//` and `/* *\/` comments and trailing commas from JSONC, leaving
+ * string literals untouched. A regex stripper cannot do this: the common alias
+ * `"@/*"` contains `/*` and would be read as the start of a block comment.
+ */
+export function stripJsonComments(text: string): string {
+  let out = '';
+  let index = 0;
+  while (index < text.length) {
+    const char = text[index]!;
+    const next = text[index + 1];
+    if (char === '"') {
+      let end = index + 1;
+      while (end < text.length && text[end] !== '"') {
+        end += text[end] === '\\' ? 2 : 1;
+      }
+      out += text.slice(index, end + 1);
+      index = end + 1;
+    } else if (char === '/' && next === '/') {
+      while (index < text.length && text[index] !== '\n') index += 1;
+    } else if (char === '/' && next === '*') {
+      const close = text.indexOf('*/', index + 2);
+      index = close === -1 ? text.length : close + 2;
+      out += ' ';
+    } else if (char === ',') {
+      // A trailing comma: the next significant character closes the container.
+      const ahead = nextSignificant(text, index + 1);
+      if (ahead !== '}' && ahead !== ']') out += char;
+      index += 1;
+    } else {
+      out += char;
+      index += 1;
+    }
+  }
+  return out;
+}
+
+/** First significant character at or after `from`, skipping whitespace and comments. */
+function nextSignificant(text: string, from: number): string | null {
+  let index = from;
+  while (index < text.length) {
+    const char = text[index]!;
+    if (/\s/.test(char)) {
+      index += 1;
+    } else if (char === '/' && text[index + 1] === '/') {
+      while (index < text.length && text[index] !== '\n') index += 1;
+    } else if (char === '/' && text[index + 1] === '*') {
+      const close = text.indexOf('*/', index + 2);
+      index = close === -1 ? text.length : close + 2;
+    } else {
+      return char;
+    }
+  }
+  return null;
+}
+
+/**
+ * Reads `compilerOptions.baseUrl` / `paths` if a tsconfig is present.
+ * A tsconfig that exists but cannot be parsed is reported through `onError`
+ * (the graph records it as a degradation) rather than silently ignored.
+ */
+export async function readTsconfigPaths(
+  snapshot: RepoSnapshot,
+  onError?: (reason: string) => void,
+): Promise<TsconfigPaths | null> {
   for (const candidate of ['tsconfig.json', 'jsconfig.json']) {
     const text = await snapshot.read(candidate);
     if (!text) continue;
+    let parsed: { compilerOptions?: { baseUrl?: string; paths?: Record<string, string[]> } };
     try {
       // Tolerate comments and trailing commas in tsconfig.
-      const stripped = text
-        .replace(/\/\*[\s\S]*?\*\//g, '')
-        .replace(/(^|[^:])\/\/.*$/gm, '$1')
-        .replace(/,(\s*[}\]])/g, '$1');
-      const parsed = JSON.parse(stripped) as {
-        compilerOptions?: { baseUrl?: string; paths?: Record<string, string[]> };
-      };
-      const options = parsed.compilerOptions;
-      if (!options?.paths && !options?.baseUrl) continue;
-      return { baseUrl: options.baseUrl ?? '.', paths: options.paths ?? {} };
-    } catch {
+      parsed = JSON.parse(stripJsonComments(text)) as typeof parsed;
+    } catch (err) {
+      onError?.(`${candidate} could not be parsed (${err instanceof Error ? err.message : String(err)}); path aliases ignored`);
       continue;
     }
+    const options = parsed?.compilerOptions;
+    if (!options?.paths && !options?.baseUrl) continue;
+    return { baseUrl: options.baseUrl ?? '.', paths: options.paths ?? {} };
   }
   return null;
 }
@@ -107,7 +168,8 @@ export async function buildGraph(
     return { analyses, dependents, unresolvedImports: 0, analyzedFiles: 0, analyzerNames: [] };
   }
 
-  const tsconfig = await readTsconfigPaths(snapshot);
+  const degradations: string[] = [];
+  const tsconfig = await readTsconfigPaths(snapshot, (reason) => degradations.push(`tsconfig:${reason}`));
   const fileSet = new Set(snapshot.files.map(tidy));
   const maxFiles = opts.maxFiles ?? 5_000;
 
@@ -143,6 +205,7 @@ export async function buildGraph(
     unresolvedImports,
     analyzedFiles: analyses.size,
     analyzerNames: [...analyzerNames],
+    degradations,
   };
 }
 

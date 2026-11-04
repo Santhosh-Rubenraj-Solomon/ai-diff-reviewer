@@ -19,15 +19,38 @@ jobs:
     runs-on: ubuntu-latest
     # Advisory until precision has been measured on your own golden set.
     continue-on-error: true
+    env:
+      # Secrets cannot be read in a job-level `if`, so expose presence as env.
+      HAS_ANTHROPIC_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+      IS_FORK: ${{ github.event.pull_request.head.repo.full_name != github.repository }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
+      # Fork pull requests get no secrets and a read-only token, and a repository
+      # without the key cannot review at all: skip with a notice, not a failure.
+      - name: Check prerequisites
+        id: gate
+        run: |
+          if [ "$IS_FORK" = "true" ]; then
+            echo "::notice title=aidr review skipped::pull requests from forks are not reviewed (no secrets, read-only token)"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          elif [ "$HAS_ANTHROPIC_KEY" != "true" ]; then
+            echo "::notice title=aidr review skipped::ANTHROPIC_API_KEY secret is not set for this repository"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - if: steps.gate.outputs.run == 'true'
+        uses: actions/checkout@v5
+      - if: steps.gate.outputs.run == 'true'
+        uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
 
-      - run: bun install --frozen-lockfile
+      - if: steps.gate.outputs.run == 'true'
+        run: bun install --frozen-lockfile
 
       - name: Review
+        if: steps.gate.outputs.run == 'true'
         run: bun run src/cli.ts review
         env:
           REVIEWER_PLATFORM: github

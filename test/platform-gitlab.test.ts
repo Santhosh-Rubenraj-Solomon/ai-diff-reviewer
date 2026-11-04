@@ -75,7 +75,7 @@ function finding(overrides: Partial<Finding> = {}): Finding {
   };
 }
 
-const CS = { baseSha: SHAS.base_sha, startSha: SHAS.start_sha, headSha: SHAS.head_sha } as ChangeSet;
+const CS = { baseSha: SHAS.base_sha, startSha: SHAS.start_sha, headSha: SHAS.head_sha, files: [] as ChangeSet["files"] } as ChangeSet;
 
 describe('GitlabPlatform.fetchChangeSet', () => {
   test('pins to diff_refs and reads content from the source (fork) project at head_sha', async () => {
@@ -220,12 +220,9 @@ describe('GitlabPlatform writes', () => {
     await expect(platform().postInline(finding(), 'b', CS)).rejects.toMatchObject({ status: 400 });
   });
 
-  // BUG (src/platform/gitlab.ts:248): postInline always sends
-  // `old_path: finding.path` (the head-side path). For a renamed file GitLab
-  // expects old_path to be the pre-rename path, so inline comments on renamed
-  // files are rejected and fall back to general notes. The ChangeSet passed in
-  // already carries `oldPath` for the file.
-  test.todo('postInline uses the pre-rename path as old_path for a renamed file', async () => {
+  // Regression (src/platform/gitlab.ts): old_path used to be the head path,
+  // so GitLab rejected inline comments on renamed files.
+  test('postInline uses the pre-rename path as old_path for a renamed file', async () => {
     const calls = route((url) => (url.endsWith('/discussions') ? jsonResponse({ id: 'd', notes: [{ id: 1 }] }) : null));
     const cs = {
       ...CS,

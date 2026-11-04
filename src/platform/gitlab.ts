@@ -225,6 +225,10 @@ export class GitlabPlatform implements Platform {
   }
 
   async postInline(finding: Finding, body: string, changeSet: ChangeSet): Promise<PostedRef> {
+    // GitLab wants the base-side path in old_path; for a renamed file that is
+    // the pre-rename path, not the head path.
+    const file = changeSet.files.find((entry) => entry.path === finding.path);
+    const oldPath = file?.oldPath ?? finding.path;
     const payload = {
       body,
       position: {
@@ -233,7 +237,7 @@ export class GitlabPlatform implements Platform {
         start_sha: changeSet.startSha,
         head_sha: changeSet.headSha,
         new_path: finding.path,
-        old_path: finding.path,
+        old_path: oldPath,
         new_line: finding.line,
       },
     };

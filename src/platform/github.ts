@@ -271,56 +271,78 @@ export class GithubPlatform implements Platform {
   /**
    * Replies in the thread, then resolves it. Resolution is GraphQL-only on
    * GitHub, so we look the thread up by its first comment's database id.
+   *
+   * Every failure propagates: the caller marks the thread resolved in its
+   * store only when this resolves, so a swallowed failure would record an
+   * open thread as closed.
    */
   async resolveThread(ref: PostedRef, body: string): Promise<void> {
     await httpRequest(
       `${this.repoBase()}/pulls/${this.deps.requestId}/comments/${ref.commentId}/replies`,
       { method: 'POST', body: JSON.stringify({ body }) },
       this.http,
-    ).catch((err) => {
-      log.warn('reply to review thread failed', { error: String(err) });
-    });
+    );
 
-    const threadId = await this.findThreadId(Number(ref.commentId));
-    if (!threadId) {
-      log.warn('could not locate review thread to resolve', { commentId: ref.commentId });
-      return;
+    const thread = await this.findThread(Number(ref.commentId));
+    if (!thread) {
+      throw new Error(`could not locate review thread for comment ${ref.commentId}`);
     }
+    // Someone already resolved it by hand; nothing left to do.
+    if (thread.isResolved) return;
     await this.graphql(
       'mutation($id:ID!){resolveReviewThread(input:{threadId:$id}){thread{id}}}',
-      { id: threadId },
-    ).catch((err) => log.warn('resolveReviewThread failed', { error: String(err) }));
+      { id: thread.id },
+    );
   }
 
-  private async findThreadId(commentDatabaseId: number): Promise<string | null> {
+  /**
+   * Finds the review thread containing a comment, following the
+   * `reviewThreads` cursor so threads past the first page are not missed.
+   * An unresolved match is preferred over a resolved one.
+   */
+  private async findThread(commentDatabaseId: number): Promise<{ id: string; isResolved: boolean } | null> {
     const [owner, repo] = this.deps.projectId.split('/');
-    const data = await this.graphql<{
-      repository: {
-        pullRequest: {
-          reviewThreads: {
-            nodes: { id: string; isResolved: boolean; comments: { nodes: { databaseId: number }[] } }[];
+    let after: string | null = null;
+    let resolvedMatch: { id: string; isResolved: boolean } | null = null;
+    const seenCursors = new Set<string>();
+
+    for (;;) {
+      const data: {
+        repository: {
+          pullRequest: {
+            reviewThreads: {
+              pageInfo?: { hasNextPage: boolean; endCursor: string | null };
+              nodes: { id: string; isResolved: boolean; comments: { nodes: { databaseId: number }[] } }[];
+            };
           };
         };
-      };
-    }>(
-      `query($owner:String!,$repo:String!,$number:Int!){
-         repository(owner:$owner,name:$repo){
-           pullRequest(number:$number){
-             reviewThreads(first:100){
-               nodes{ id isResolved comments(first:1){ nodes{ databaseId } } }
+      } = await this.graphql(
+        `query($owner:String!,$repo:String!,$number:Int!,$after:String){
+           repository(owner:$owner,name:$repo){
+             pullRequest(number:$number){
+               reviewThreads(first:100,after:$after){
+                 pageInfo{ hasNextPage endCursor }
+                 nodes{ id isResolved comments(first:1){ nodes{ databaseId } } }
+               }
              }
            }
-         }
-       }`,
-      { owner, repo, number: Number(this.deps.requestId) },
-    ).catch(() => null);
+         }`,
+        { owner, repo, number: Number(this.deps.requestId), ...(after ? { after } : {}) },
+      );
 
-    if (!data) return null;
-    for (const thread of data.repository.pullRequest.reviewThreads.nodes) {
-      if (thread.isResolved) continue;
-      if (thread.comments.nodes.some((c) => c.databaseId === commentDatabaseId)) return thread.id;
+      const threads = data.repository.pullRequest.reviewThreads;
+      for (const thread of threads.nodes) {
+        if (!thread.comments.nodes.some((c) => c.databaseId === commentDatabaseId)) continue;
+        if (!thread.isResolved) return { id: thread.id, isResolved: false };
+        resolvedMatch ??= { id: thread.id, isResolved: true };
+      }
+
+      const next = threads.pageInfo?.hasNextPage ? threads.pageInfo.endCursor : null;
+      if (!next || seenCursors.has(next)) break;
+      seenCursors.add(next);
+      after = next;
     }
-    return null;
+    return resolvedMatch;
   }
 
   private async graphql<T>(query: string, variables: Record<string, unknown>): Promise<T> {

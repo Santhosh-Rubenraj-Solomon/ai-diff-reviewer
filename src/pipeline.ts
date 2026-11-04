@@ -173,6 +173,7 @@ export async function runReview(cfg: Config, opts: RunOptions): Promise<RunResul
       });
       if (graph) {
         degrade(`context-analyzer:${graph.analyzerNames.join(',') || 'none'}`);
+        for (const entry of graph.degradations ?? []) degrade(`context-${entry}`);
         log.stage({
           stage: 'context:graph',
           files: graph.analyzedFiles,

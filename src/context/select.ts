@@ -137,7 +137,9 @@ async function rippleFor(
         text: renderNumberedContent(lines.slice(start - 1, end).join('\n'), start),
       });
       taken += 1;
-      index = end; // do not emit overlapping windows
+      // 1-based `end` is 0-based `end - 1`; the loop increment then lands on the
+      // first line after the window, so windows never overlap and none is skipped.
+      index = end - 1;
     }
   }
 

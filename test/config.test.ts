@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { ConfigError, loadConfig, unpricedModels } from '../src/config.ts';
-import { parseArgs } from '../src/cli.ts';
+import { configFrom, parseArgs } from '../src/cli.ts';
 import { classify, languageOf } from '../src/diff/filter.ts';
 import { priceUsd } from '../src/review/pricing.ts';
 
@@ -85,6 +85,28 @@ describe('parseArgs', () => {
   test('rejects negation flags instead of silently ignoring them', () => {
     // `--no-x` under meow-style parsing becomes a no-op nobody notices.
     expect(() => parseArgs(['review', '--no-judge'])).toThrow(/Negation flags/);
+  });
+});
+
+describe('configFrom', () => {
+  // On GitHub Actions GITHUB_REPOSITORY is always set, which auto-selects the
+  // github platform and its credential checks. `rules check` only reads local
+  // rule files, so it must not demand a token or a pull request number.
+  const actionsEnv = { GITHUB_REPOSITORY: 'acme/shop', GITHUB_ACTIONS: 'true' };
+
+  test('a local-default command needs no hosted-platform credentials in CI', () => {
+    const cfg = configFrom(parseArgs(['rules', 'check']), actionsEnv, 'local');
+    expect(cfg.platform).toBe('local');
+  });
+
+  test('an explicit --platform still wins and is still validated', () => {
+    expect(() => configFrom(parseArgs(['rules', 'check', '--platform=github']), actionsEnv, 'local')).toThrow(
+      /REVIEWER_MR_IID/,
+    );
+  });
+
+  test('review keeps auto-detecting the hosted platform', () => {
+    expect(() => configFrom(parseArgs(['review']), actionsEnv)).toThrow(/REVIEWER_TOKEN/);
   });
 });
 
