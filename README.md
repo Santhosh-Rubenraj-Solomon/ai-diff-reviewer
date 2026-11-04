@@ -147,7 +147,9 @@ single-currency module.
 - The judge is shown the text of any rule a finding cites, so a rule-backed
   finding cannot be rejected as "generic advice".
 - `aidr rules check` exits non-zero on a bad rule, an oversized rule, or a
-  scoped rule that matches nothing.
+  scoped rule that matches nothing. It checks the rules in the working tree
+  and needs no platform credentials, even in CI; pass `--platform` to check a
+  hosted target branch instead.
 
 This repository dogfoods its own rules in [`.review/`](.review/).
 

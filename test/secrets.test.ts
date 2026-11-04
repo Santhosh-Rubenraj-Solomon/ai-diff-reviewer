@@ -120,9 +120,16 @@ describe('confineToRepo', () => {
     expect(confineToRepo('/repo', 'config/.env')).toBeNull();
   });
 
-  // Over-strict rather than unsafe: `includes('..')` also rejects a legal file
-  // name such as `a..b.ts`. Documented here; not a security issue.
-  test('rejects a filename that merely contains two dots (over-strict)', () => {
-    expect(confineToRepo('/repo', 'src/a..b.ts')).toBeNull();
+  // Traversal is checked per path segment, so a legal file name that merely
+  // contains two dots is accepted while a `..` segment is still refused.
+  test('accepts a filename that merely contains two dots', () => {
+    expect(confineToRepo('/repo', 'src/a..b.ts')).toBe('/repo/src/a..b.ts');
+    expect(confineToRepo('/repo', '..hidden/x.ts')).toBe('/repo/..hidden/x.ts');
+    expect(confineToRepo('/repo', 'src/..')).toBeNull();
+    expect(confineToRepo('/repo', 'src/a/../../../x.ts')).toBeNull();
+  });
+
+  test('refuses Windows drive-absolute paths', () => {
+    expect(confineToRepo('/repo', 'C:\\Windows\\x.ts')).toBeNull();
   });
 });

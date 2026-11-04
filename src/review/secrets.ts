@@ -75,7 +75,9 @@ export function isDeniedPath(path: string): boolean {
 /** Confines a path to the repository root; returns null when it escapes. */
 export function confineToRepo(root: string, candidate: string): string | null {
   const normalized = candidate.replace(/\\/g, '/').replace(/^\.\//, '');
-  if (normalized.startsWith('/') || normalized.includes('..')) return null;
+  if (normalized.startsWith('/') || /^[a-zA-Z]:/.test(normalized)) return null;
+  // Traversal is a `..` path segment; a file name like `a..b.ts` is legal.
+  if (normalized.split('/').some((segment) => segment === '..')) return null;
   if (isDeniedPath(normalized)) return null;
   return `${root.replace(/\/$/, '')}/${normalized}`;
 }

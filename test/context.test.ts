@@ -203,13 +203,10 @@ describe('readTsconfigPaths', () => {
     expect(await readTsconfigPaths(snapshot)).toEqual({ baseUrl: '.', paths: { '@/*': ['src/*'] } });
   });
 
-  // BUG (src/context/graph.ts:40): the block-comment stripper
-  // `/\/\*[\s\S]*?\*\//g` treats the `/*` inside the extremely common alias
-  // string "@/*" as the start of a comment and deletes everything up to the
-  // next real `*/`. With any block comment later in the file the JSON breaks,
-  // the catch swallows it, and aliases are silently ignored — the import graph
-  // then drops every aliased edge without a degradation being recorded.
-  test.todo('an "@/*" alias survives a later block comment in tsconfig', async () => {
+  // Regression (src/context/graph.ts): a regex block-comment stripper treated
+  // the `/*` inside the common alias string "@/*" as a comment start and, with
+  // any later real block comment, broke the JSON — silently dropping aliases.
+  test('an "@/*" alias survives a later block comment in tsconfig', async () => {
     const snapshot = memorySnapshot({
       'tsconfig.json': `{
         "compilerOptions": { "baseUrl": ".", "paths": { "@/*": ["src/*"] } }
@@ -217,6 +214,29 @@ describe('readTsconfigPaths', () => {
       }`,
     });
     expect(await readTsconfigPaths(snapshot)).toEqual({ baseUrl: '.', paths: { '@/*': ['src/*'] } });
+  });
+
+  test('line comments, trailing commas and comment-like text in strings are handled', async () => {
+    const snapshot = memorySnapshot({
+      'tsconfig.json': `{
+        // leading note
+        "compilerOptions": {
+          "baseUrl": "./", /* inline */
+          "paths": { "@/*": ["src/*"], "~//x": ["lib/\\"q\\"/*"], },
+        },
+      }`,
+    });
+    expect(await readTsconfigPaths(snapshot)).toEqual({
+      baseUrl: './',
+      paths: { '@/*': ['src/*'], '~//x': ['lib/"q"/*'] },
+    });
+  });
+
+  test('an unparseable tsconfig is reported, not swallowed', async () => {
+    const reasons: string[] = [];
+    expect(await readTsconfigPaths(memorySnapshot({ 'tsconfig.json': '{ not json' }), (r) => reasons.push(r))).toBeNull();
+    expect(reasons).toHaveLength(1);
+    expect(reasons[0]).toContain('tsconfig.json could not be parsed');
   });
 });
 
@@ -229,6 +249,11 @@ describe('buildGraph / dependentsOf', () => {
     'README.md': 'not code we analyse? markdown has a language but no analyzer',
     'tool.py': 'import os',
   };
+
+  test('buildGraph records a degradation when tsconfig cannot be parsed', async () => {
+    const graph = await buildGraph(memorySnapshot({ 'tsconfig.json': '{ "compilerOptions": ', 'src/a.ts': 'export const a = 1;' }));
+    expect(graph.degradations?.some((d) => d.startsWith('tsconfig:tsconfig.json could not be parsed'))).toBe(true);
+  });
 
   test('builds reverse edges from resolved imports and counts unresolved relative ones', async () => {
     const graph = await buildGraph(memorySnapshot(repo));
@@ -399,12 +424,9 @@ describe('selectContext', () => {
     expect(report.contexts[0]!.ripple).toHaveLength(2);
   });
 
-  // BUG (src/context/select.ts:144): after emitting a window that ends at
-  // 1-based line `end`, the loop sets `index = end` and then the for-loop's
-  // `index += 1` advances to 0-based `end + 1`. 0-based `end` (the first line
-  // after the window) is never examined, so a call site immediately following a
-  // window is silently missed. The fix is `index = end - 1`.
-  test.todo('a call site on the line right after a ripple window is still found', async () => {
+  // Regression (src/context/select.ts): the loop used to set `index = end`
+  // before the for-loop increment, skipping the first line after each window.
+  test('a call site on the line right after a ripple window is still found', async () => {
     const snapshot = memorySnapshot({
       'src/core.ts': coreHead,
       // radius 1: hit on line 2 -> window 1..3; the next use is on line 4.

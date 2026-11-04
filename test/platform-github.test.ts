@@ -266,10 +266,14 @@ describe('GithubPlatform writes', () => {
 
   test('GitHub Enterprise uses /api/graphql rather than /api/v3/graphql', async () => {
     const ghe = 'https://ghe.example.com/api/v3';
-    const calls = mockFetch((url) => {
+    const calls = mockFetch((url, init) => {
       if (url === `${ghe}/repos/acme/shop/pulls/7/comments/1/replies`) return jsonResponse({});
       if (url === 'https://ghe.example.com/api/graphql') {
-        return jsonResponse({ data: { repository: { pullRequest: { reviewThreads: { nodes: [] } } } } });
+        if (JSON.parse(init.body as string).query.startsWith('mutation')) {
+          return jsonResponse({ data: { resolveReviewThread: { thread: { id: 'T' } } } });
+        }
+        const nodes = [{ id: 'T', isResolved: false, comments: { nodes: [{ databaseId: 1 }] } }];
+        return jsonResponse({ data: { repository: { pullRequest: { reviewThreads: { nodes } } } } });
       }
       return new Response('', { status: 404 });
     });
@@ -278,48 +282,98 @@ describe('GithubPlatform writes', () => {
     expect(calls.calls.some((c) => c.url === 'https://ghe.example.com/api/graphql')).toBe(true);
   });
 
-  test('a GraphQL error payload does not resolve anything', async () => {
+  test('a GraphQL error payload does not resolve anything and rejects', async () => {
     const calls = route((url) => {
       if (url.endsWith('/replies')) return jsonResponse({});
       if (url.endsWith('/graphql')) return jsonResponse({ data: null, errors: [{ message: 'denied' }] });
       return null;
     });
-    await platform().resolveThread({ commentId: '1', fallback: false }, 'x');
+    await expect(platform().resolveThread({ commentId: '1', fallback: false }, 'x')).rejects.toThrow('denied');
     // Only the lookup query was attempted; no mutation followed.
     expect(calls.filter((c) => c.url.endsWith('/graphql'))).toHaveLength(1);
   });
 
-  // GAP vs .review/no-silent-failures.md and the Platform contract: when the
-  // reply, the thread lookup, or the resolve mutation fails, resolveThread only
-  // logs at warn and resolves successfully (src/platform/github.ts:265-279).
-  // The caller cannot tell a resolved thread from an unresolved one, so the
-  // store may record it as resolved. Expected: reject (or report) on failure.
-  test.todo('resolveThread rejects when the thread could not be resolved', async () => {
+  // Regression (.review/no-silent-failures.md): resolveThread used to log at
+  // warn and resolve successfully on failure, so comments.ts marked open
+  // threads as resolved.
+  test('resolveThread rejects when the thread could not be resolved', async () => {
     route((url) => {
       if (url.endsWith('/replies')) return jsonResponse({});
       if (url.endsWith('/graphql')) return jsonResponse({ data: { repository: { pullRequest: { reviewThreads: { nodes: [] } } } } });
       return null;
     });
-    await expect(platform().resolveThread({ commentId: '1', fallback: false }, 'x')).rejects.toThrow();
+    await expect(platform().resolveThread({ commentId: '1', fallback: false }, 'x')).rejects.toThrow(
+      'could not locate review thread',
+    );
   });
 
-  // GAP vs .review/platform-reads-are-pinned.md ("a list endpoint consumed
-  // without following its pagination cursor"): findThreadId queries
-  // `reviewThreads(first:100)` with no pageInfo/after cursor
-  // (src/platform/github.ts:290). On a PR with more than 100 review threads, a
-  // thread beyond the first page is never found and never resolved.
-  test.todo('findThreadId follows the reviewThreads cursor past the first 100 threads', async () => {
+  test('resolveThread rejects when the reply fails', async () => {
+    route((url) => (url.endsWith('/replies') ? new Response('', { status: 403 }) : null));
+    await expect(platform().resolveThread({ commentId: '1', fallback: false }, 'x')).rejects.toMatchObject({ status: 403 });
+  });
+
+  test('resolveThread rejects when the resolve mutation fails', async () => {
+    route((url, init) => {
+      if (url.endsWith('/replies')) return jsonResponse({});
+      if (url.endsWith('/graphql')) {
+        if (JSON.parse(init.body as string).query.startsWith('mutation')) {
+          return jsonResponse({ data: null, errors: [{ message: 'forbidden' }] });
+        }
+        const nodes = [{ id: 'T', isResolved: false, comments: { nodes: [{ databaseId: 1 }] } }];
+        return jsonResponse({ data: { repository: { pullRequest: { reviewThreads: { nodes } } } } });
+      }
+      return null;
+    });
+    await expect(platform().resolveThread({ commentId: '1', fallback: false }, 'x')).rejects.toThrow('forbidden');
+  });
+
+  test('a thread already resolved by hand counts as resolved without a mutation', async () => {
     const queries: string[] = [];
     route((url, init) => {
       if (url.endsWith('/replies')) return jsonResponse({});
       if (url.endsWith('/graphql')) {
-        const body = JSON.parse(init.body as string);
-        queries.push(body.query);
-        return jsonResponse({ data: { repository: { pullRequest: { reviewThreads: { nodes: [] } } } } });
+        queries.push(JSON.parse(init.body as string).query);
+        const nodes = [{ id: 'T', isResolved: true, comments: { nodes: [{ databaseId: 1 }] } }];
+        return jsonResponse({ data: { repository: { pullRequest: { reviewThreads: { nodes } } } } });
       }
       return null;
     });
     await platform().resolveThread({ commentId: '1', fallback: false }, 'x');
-    expect(queries[0]).toContain('pageInfo');
+    expect(queries.some((q) => q.startsWith('mutation'))).toBe(false);
+  });
+
+  // Regression (.review/platform-reads-are-pinned.md): findThreadId used to
+  // read only reviewThreads(first:100), so threads past page one were missed.
+  test('findThreadId follows the reviewThreads cursor past the first 100 threads', async () => {
+    const bodies: { query: string; variables: Record<string, unknown> }[] = [];
+    route((url, init) => {
+      if (url.endsWith('/replies')) return jsonResponse({});
+      if (url.endsWith('/graphql')) {
+        const body = JSON.parse(init.body as string);
+        bodies.push(body);
+        if (body.query.startsWith('mutation')) return jsonResponse({ data: { resolveReviewThread: { thread: { id: 'T101' } } } });
+        const page2 = body.variables.after === 'c1';
+        const reviewThreads = page2
+          ? {
+              pageInfo: { hasNextPage: false, endCursor: 'c2' },
+              nodes: [{ id: 'T101', isResolved: false, comments: { nodes: [{ databaseId: 1 }] } }],
+            }
+          : {
+              pageInfo: { hasNextPage: true, endCursor: 'c1' },
+              nodes: Array.from({ length: 100 }, (_, i) => ({
+                id: `T${i}`,
+                isResolved: false,
+                comments: { nodes: [{ databaseId: 1000 + i }] },
+              })),
+            };
+        return jsonResponse({ data: { repository: { pullRequest: { reviewThreads } } } });
+      }
+      return null;
+    });
+    await platform().resolveThread({ commentId: '1', fallback: false }, 'x');
+    expect(bodies[0]!.query).toContain('pageInfo');
+    expect(bodies[0]!.variables.after).toBeUndefined();
+    expect(bodies[1]!.variables.after).toBe('c1');
+    expect(bodies[2]!.variables).toEqual({ id: 'T101' });
   });
 });

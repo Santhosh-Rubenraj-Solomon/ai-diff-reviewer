@@ -98,13 +98,25 @@ function bool(flags: Args['flags'], key: string): boolean {
   return flags.get(key) === true || flags.get(key) === 'true';
 }
 
-function configFrom(args: Args): Config {
+/**
+ * `defaultPlatform` applies only when `--platform` is not given. Commands that
+ * work on local files (`rules check`, `runs`) default to `local`, so CI
+ * environment detection (GITHUB_REPOSITORY, CI_MERGE_REQUEST_IID) does not make
+ * them demand a token and a merge request id they never use.
+ */
+export function configFrom(
+  args: Args,
+  env: Record<string, string | undefined> = process.env,
+  defaultPlatform?: 'local',
+): Config {
   const { flags } = args;
   const overrides: Parameters<typeof loadConfig>[1] = {};
 
   const platform = str(flags, 'platform');
   if (platform === 'gitlab' || platform === 'github' || platform === 'local') {
     overrides.platform = platform;
+  } else if (defaultPlatform) {
+    overrides.platform = defaultPlatform;
   }
   const project = str(flags, 'project');
   if (project) overrides.projectId = project;
@@ -135,7 +147,7 @@ function configFrom(args: Args): Config {
   const rulesDir = str(flags, 'rules-dir');
   if (rulesDir) overrides.rulesDir = rulesDir;
 
-  const cfg = loadConfig(process.env, overrides);
+  const cfg = loadConfig(env, overrides);
   // The local adapter cannot post; make that explicit rather than failing late.
   if (cfg.platform === 'local') cfg.dryRun = true;
   return cfg;
@@ -207,7 +219,9 @@ async function commandReview(args: Args): Promise<number> {
 }
 
 async function commandRulesCheck(args: Args): Promise<number> {
-  const cfg = configFrom(args);
+  // Validates the rule files in the working tree; pass --platform to check the
+  // rules on a hosted target branch instead (that needs platform credentials).
+  const cfg = configFrom(args, process.env, 'local');
   configureLogger({ format: cfg.logFormat });
 
   const repoRoot = str(args.flags, 'repo') ?? process.cwd();
@@ -219,7 +233,14 @@ async function commandRulesCheck(args: Args): Promise<number> {
     totalMaxBytes: cfg.ruleTotalMaxBytes,
   });
 
-  const paths = await platform.listTargetBranchTree('').catch(() => []);
+  let treeFailed = false;
+  const paths = await platform.listTargetBranchTree('').catch((err: unknown) => {
+    treeFailed = true;
+    process.stderr.write(
+      `error: could not list repository files to match rules against: ${err instanceof Error ? err.message : String(err)}\n`,
+    );
+    return [] as string[];
+  });
   const counts = matchCounts(result.rules, paths);
 
   process.stdout.write(`Loaded ${result.rules.length} rule(s) from ${cfg.rulesDir}\n`);
@@ -248,11 +269,12 @@ async function commandRulesCheck(args: Args): Promise<number> {
     );
   }
 
-  return result.errors.length > 0 || result.dropped.length > 0 || unmatched.length > 0 ? 1 : 0;
+  return treeFailed || result.errors.length > 0 || result.dropped.length > 0 || unmatched.length > 0 ? 1 : 0;
 }
 
 function commandRuns(args: Args): number {
-  const cfg = configFrom(args);
+  // Reads the local state database only; no platform settings are needed.
+  const cfg = configFrom(args, process.env, 'local');
   const store = new Store(cfg.stateDbPath);
   const [, sub, runId] = args.command;
 
